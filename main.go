@@ -21,11 +21,12 @@ var db *sql.DB
 func main() {
 	var err error
 
-	db, err = sql.Open("sqlite", DB_PATH)
+	db, err = sql.Open("sqlite", DB_PATH+"?_foreign_keys=on")
 	if err != nil {
 		log.Fatalf("Failed to open SQLite: %v", err)
 	}
 
+	// Create database file by executing a simple query
 	if err := db.Ping(); err != nil {
 		log.Fatalf("Failed to ping SQLite: %v", err)
 	}
