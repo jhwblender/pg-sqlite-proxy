@@ -21,7 +21,7 @@ var db *sql.DB
 func main() {
 	var err error
 
-	db, err = sql.Open("sqlite", DB_PATH+"?_foreign_keys=on")
+	db, err = sql.Open("sqlite", DB_PATH)
 	if err != nil {
 		log.Fatalf("Failed to open SQLite: %v", err)
 	}
@@ -30,6 +30,13 @@ func main() {
 	if err := db.Ping(); err != nil {
 		log.Fatalf("Failed to ping SQLite: %v", err)
 	}
+
+	// Explicitly create the database file by executing a simple query
+	_, err = db.Exec("SELECT 1")
+	if err != nil {
+		log.Fatalf("Failed to execute test query: %v", err)
+	}
+
 	fmt.Println("SQLite database connected at:", DB_PATH)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", PROXY_PORT))
@@ -71,6 +78,7 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
+	// Send Authentication OK
 	authMsg := make([]byte, 8)
 	authMsg[0] = 'R'
 	binary.BigEndian.PutUint32(authMsg[1:5], 8)
@@ -79,6 +87,7 @@ func handleConnection(conn net.Conn) {
 	authMsg[7] = 0
 	conn.Write(authMsg)
 
+	// Send BackendKeyData
 	keyData := make([]byte, 12)
 	keyData[0] = 'K'
 	binary.BigEndian.PutUint32(keyData[1:5], 12)
@@ -86,6 +95,7 @@ func handleConnection(conn net.Conn) {
 	binary.BigEndian.PutUint32(keyData[9:13], 67890)
 	conn.Write(keyData)
 
+	// Send ReadyForQuery
 	ready := make([]byte, 5)
 	ready[0] = 'Z'
 	binary.BigEndian.PutUint32(ready[1:5], 5)
