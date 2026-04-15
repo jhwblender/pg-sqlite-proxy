@@ -1,0 +1,1 @@
+	db, err = sql.Open("sqlite", "file:"+DB_PATH+"?_foreign_keys=on&mode=rwc")
