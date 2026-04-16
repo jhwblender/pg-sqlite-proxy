@@ -314,5 +314,42 @@ func translateQuery(sql string) string {
 	translated = strings.ReplaceAll(translated, "VARCHAR", "TEXT")
 	translated = strings.ReplaceAll(translated, "DECIMAL", "REAL")
 
+	translated = strings.ReplaceAll(translated, "::bigint", "")
+	translated = strings.ReplaceAll(translated, "::int", "")
+	translated = strings.ReplaceAll(translated, "::float", "")
+	translated = strings.ReplaceAll(translated, "::numeric", "")
+
+	translated = strings.ReplaceAll(translated, "pg_advisory_xact_lock", "sqlite_advisory_lock")
+
+	translated = strings.ReplaceAll(translated, "generate_series", "generate_series_mock")
+	translated = strings.ReplaceAll(translated, "unnest", "unnest_mock")
+
+	reInterval := regexp.MustCompile(`'(\d+)\s*(days?|hours?|minutes?)'`)
+	translated = reInterval.ReplaceAllStringFunc(translated, func(match string) string {
+		num := reInterval.ReplaceAllString(match, "$1")
+		unit := reInterval.ReplaceAllString(match, "$2")
+		switch unit {
+		case "day", "days":
+			return num + " * 86400"
+		case "hour", "hours":
+			return num + " * 3600"
+		case "minute", "minutes":
+			return num + " * 60"
+		default:
+			return num
+		}
+	})
+
+	translated = strings.ReplaceAll(translated, "interval", "")
+
+	reAny := regexp.MustCompile(`=ANY\(\$(\d+)\)`)
+	translated = reAny.ReplaceAllString(translated, "IN (SELECT value FROM json_each(CAST(? AS TEXT)))")
+
+	reCastArrayInt := regexp.MustCompile(`\$(\d+)::int\[\]`)
+	translated = reCastArrayInt.ReplaceAllString(translated, "?")
+
+	reCastArrayBigInt := regexp.MustCompile(`\$(\d+)::bigint\[\]`)
+	translated = reCastArrayBigInt.ReplaceAllString(translated, "?")
+
 	return translated
 }
