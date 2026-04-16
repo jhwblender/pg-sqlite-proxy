@@ -78,37 +78,62 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Send Authentication OK
-	authMsg := make([]byte, 8)
+	fmt.Printf("Startup message length: %d\n", msgLen)
+	fmt.Printf("Startup message bytes: %v\n", msg)
+	fmt.Printf("Startup message (decoded): %q\n", string(msg))
+
+	msg = bytes.TrimRight(msg, "\x00")
+	fmt.Printf("Startup message (trimmed): %q\n", string(msg))
+
+	// Send Authentication OK (type 0 = ok)
+	authMsg := make([]byte, 9)
 	authMsg[0] = 'R'
-	binary.BigEndian.PutUint32(authMsg[1:5], 8)
-	authMsg[5] = 0
-	authMsg[6] = 0
-	authMsg[7] = 0
+	binary.BigEndian.PutUint32(authMsg[1:5], 9)
+	binary.BigEndian.PutUint32(authMsg[5:9], 0)
 	conn.Write(authMsg)
 
+	// Send ParameterStatus (server_version)
+	serverVersion := "9.6.0"
+	versionBuf := new(bytes.Buffer)
+	versionBuf.WriteByte('S')
+	versionBuf.Write([]byte{0, 0, 0, 0})
+	versionBuf.WriteByte(0)
+	versionBuf.Write([]byte("server_version\x00"))
+	versionBuf.Write([]byte(serverVersion + "\x00"))
+	length := versionBuf.Len() - 5
+	versionData := versionBuf.Bytes()
+	binary.BigEndian.PutUint32(versionData[1:5], uint32(length))
+	conn.Write(versionData)
+
 	// Send BackendKeyData
-	keyData := make([]byte, 12)
+	keyData := make([]byte, 13)
 	keyData[0] = 'K'
-	binary.BigEndian.PutUint32(keyData[1:5], 12)
+	binary.BigEndian.PutUint32(keyData[1:5], 13)
 	binary.BigEndian.PutUint32(keyData[5:9], 12345)
 	binary.BigEndian.PutUint32(keyData[9:13], 67890)
+	fmt.Printf("Sending BackendKeyData: %v\n", keyData)
 	conn.Write(keyData)
 
-	// Send ReadyForQuery
-	ready := make([]byte, 5)
+	// Send ReadyForQuery (transaction idle state)
+	ready := make([]byte, 6)
 	ready[0] = 'Z'
 	binary.BigEndian.PutUint32(ready[1:5], 5)
-	ready[4] = 'I'
+	ready[5] = 'I'
+	fmt.Printf("Sending ReadyForQuery: %v\n", ready)
 	conn.Write(ready)
+	fmt.Printf("Sent ReadyForQuery, waiting for client messages\n")
+
+	fmt.Println("Startup complete, waiting for queries")
 
 	for {
 		msgType := make([]byte, 1)
-		_, err := conn.Read(msgType)
+		n, err := conn.Read(msgType)
 		if err != nil {
+			fmt.Printf("Error reading message type: %v, n=%d\n", err, n)
 			fmt.Println("Client disconnected")
 			return
 		}
+		fmt.Printf("Received message type: %c (0x%02x)\n", msgType[0], msgType[0])
 
 		if msgType[0] == 'X' {
 			fmt.Println("Client exited")
@@ -118,13 +143,16 @@ func handleConnection(conn net.Conn) {
 		lenBuf := make([]byte, 4)
 		_, err = conn.Read(lenBuf)
 		if err != nil {
+			fmt.Printf("Error reading length: %v\n", err)
 			return
 		}
 		msgLen := int(binary.BigEndian.Uint32(lenBuf))
+		fmt.Printf("Message length: %d\n", msgLen)
 
 		msg := make([]byte, msgLen-4)
 		_, err = conn.Read(msg)
 		if err != nil {
+			fmt.Printf("Error reading message: %v\n", err)
 			return
 		}
 
