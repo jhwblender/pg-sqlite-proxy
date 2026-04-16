@@ -351,5 +351,14 @@ func translateQuery(sql string) string {
 	reCastArrayBigInt := regexp.MustCompile(`\$(\d+)::bigint\[\]`)
 	translated = reCastArrayBigInt.ReplaceAllString(translated, "?")
 
+	reCastArrayNumeric := regexp.MustCompile(`\$(\d+)::numeric\[\]`)
+	translated = reCastArrayNumeric.ReplaceAllString(translated, "?")
+
+	reIntervalMath := regexp.MustCompile(`\((\d+)\s*\|\|\s*' minutes'\s*\)::interval`)
+	translated = reIntervalMath.ReplaceAllStringFunc(translated, func(match string) string {
+		num := reIntervalMath.ReplaceAllString(match, "$1")
+		return num + " * 60"
+	})
+
 	return translated
 }
