@@ -7,11 +7,25 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+func logMessage(msg string) {
+	f, err := os.OpenFile("proxy.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	timestamp := time.Now().Format(time.RFC3339Nano)
+	logLine := fmt.Sprintf("[%s] %s\n", timestamp, msg)
+	f.WriteString(logLine)
+	os.Stdout.WriteString(logLine)
+}
 
 const DB_PATH = "C:\\Users\\as74t\\Documents\\infinite-pixels-database\\infinite-pixels.db"
 const PROXY_PORT = 5433
@@ -26,18 +40,16 @@ func main() {
 		log.Fatalf("Failed to open SQLite: %v", err)
 	}
 
-	// Create database file by executing a simple query
 	if err := db.Ping(); err != nil {
 		log.Fatalf("Failed to ping SQLite: %v", err)
 	}
 
-	// Explicitly create the database file by executing a simple query
 	_, err = db.Exec("SELECT 1")
 	if err != nil {
 		log.Fatalf("Failed to execute test query: %v", err)
 	}
 
-	fmt.Println("SQLite database connected at:", DB_PATH)
+	logMessage("SQLite database connected at: " + DB_PATH)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", PROXY_PORT))
 	if err != nil {
@@ -45,7 +57,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	fmt.Printf("PostgreSQL proxy listening on port %d\n", PROXY_PORT)
+	logMessage(fmt.Sprintf("PostgreSQL proxy listening on port %d", PROXY_PORT))
 
 	for {
 		conn, err := listener.Accept()
@@ -60,37 +72,51 @@ func main() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	fmt.Println("Client connected")
+	logMessage("Client connected")
 
 	buf := make([]byte, 4)
 	_, err := conn.Read(buf)
 	if err != nil {
-		fmt.Printf("Failed to read startup: %v\n", err)
+		logMessage(fmt.Sprintf("Failed to read startup: %v", err))
 		return
 	}
 
 	msgLen := int(binary.BigEndian.Uint32(buf))
 
+	// Check for SSL request (length 8, SSL code 80877103 = 0x58565243)
+	if msgLen == 8 && buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 8 {
+		logMessage("SSL request detected, responding with N")
+		conn.Write([]byte{'N'})
+		logMessage("Sent SSL denial")
+		_, err = conn.Read(buf)
+		if err != nil {
+			logMessage(fmt.Sprintf("Failed to read startup: %v", err))
+			return
+		}
+		msgLen = int(binary.BigEndian.Uint32(buf))
+	}
+
 	msg := make([]byte, msgLen-4)
 	_, err = conn.Read(msg)
 	if err != nil {
-		fmt.Printf("Failed to read startup message: %v\n", err)
+		logMessage(fmt.Sprintf("Failed to read startup message: %v", err))
 		return
 	}
 
-	fmt.Printf("Startup message length: %d\n", msgLen)
-	fmt.Printf("Startup message bytes: %v\n", msg)
-	fmt.Printf("Startup message (decoded): %q\n", string(msg))
+	logMessage(fmt.Sprintf("Startup message length: %d", msgLen))
+	logMessage(fmt.Sprintf("Startup message bytes: %v", msg))
+	logMessage(fmt.Sprintf("Startup message (decoded): %q", string(msg)))
 
 	msg = bytes.TrimRight(msg, "\x00")
-	fmt.Printf("Startup message (trimmed): %q\n", string(msg))
+	logMessage(fmt.Sprintf("Startup message (trimmed): %q", string(msg)))
 
-	// Send Authentication OK (type 0 = ok)
 	authMsg := make([]byte, 9)
 	authMsg[0] = 'R'
 	binary.BigEndian.PutUint32(authMsg[1:5], 9)
 	binary.BigEndian.PutUint32(authMsg[5:9], 0)
+	logMessage(fmt.Sprintf("Sending Auth: %v", authMsg))
 	conn.Write(authMsg)
+	logMessage("Sent Auth OK")
 
 	// Send ParameterStatus (server_version)
 	serverVersion := "9.6.0"
@@ -103,63 +129,66 @@ func handleConnection(conn net.Conn) {
 	length := versionBuf.Len() - 5
 	versionData := versionBuf.Bytes()
 	binary.BigEndian.PutUint32(versionData[1:5], uint32(length))
+	logMessage(fmt.Sprintf("Sending ParameterStatus: %v", versionData))
 	conn.Write(versionData)
+	logMessage("Sent ParameterStatus")
 
-	// Send BackendKeyData
+	// Send BackendKeyData (length = 8 bytes payload: 2 x 4-byte ints)
 	keyData := make([]byte, 13)
 	keyData[0] = 'K'
-	binary.BigEndian.PutUint32(keyData[1:5], 13)
+	binary.BigEndian.PutUint32(keyData[1:5], 8)
 	binary.BigEndian.PutUint32(keyData[5:9], 12345)
 	binary.BigEndian.PutUint32(keyData[9:13], 67890)
-	fmt.Printf("Sending BackendKeyData: %v\n", keyData)
+	logMessage(fmt.Sprintf("Sending BackendKeyData: %v", keyData))
 	conn.Write(keyData)
+	logMessage("Sent BackendKeyData")
 
 	// Send ReadyForQuery (transaction idle state)
 	ready := make([]byte, 6)
 	ready[0] = 'Z'
 	binary.BigEndian.PutUint32(ready[1:5], 5)
 	ready[5] = 'I'
-	fmt.Printf("Sending ReadyForQuery: %v\n", ready)
+	logMessage(fmt.Sprintf("Sending ReadyForQuery: %v", ready))
 	conn.Write(ready)
-	fmt.Printf("Sent ReadyForQuery, waiting for client messages\n")
+	logMessage("Sent ReadyForQuery, waiting for client messages")
 
-	fmt.Println("Startup complete, waiting for queries")
+	logMessage("Startup complete, waiting for queries")
 
 	for {
 		msgType := make([]byte, 1)
 		n, err := conn.Read(msgType)
 		if err != nil {
-			fmt.Printf("Error reading message type: %v, n=%d\n", err, n)
-			fmt.Println("Client disconnected")
+			logMessage(fmt.Sprintf("Error reading message type: %v, n=%d", err, n))
+			logMessage("Client disconnected")
 			return
 		}
-		fmt.Printf("Received message type: %c (0x%02x)\n", msgType[0], msgType[0])
+		logMessage(fmt.Sprintf("Received message type: %c (0x%02x)", msgType[0], msgType[0]))
 
 		if msgType[0] == 'X' {
-			fmt.Println("Client exited")
+			logMessage("Client exited")
 			return
 		}
 
 		lenBuf := make([]byte, 4)
 		_, err = conn.Read(lenBuf)
 		if err != nil {
-			fmt.Printf("Error reading length: %v\n", err)
+			logMessage(fmt.Sprintf("Error reading length: %v", err))
 			return
 		}
 		msgLen := int(binary.BigEndian.Uint32(lenBuf))
-		fmt.Printf("Message length: %d\n", msgLen)
+		logMessage(fmt.Sprintf("Message length: %d", msgLen))
 
 		msg := make([]byte, msgLen-4)
 		_, err = conn.Read(msg)
 		if err != nil {
-			fmt.Printf("Error reading message: %v\n", err)
+			logMessage(fmt.Sprintf("Error reading message: %v", err))
 			return
 		}
 
 		switch msgType[0] {
 		case 'Q':
 			query := strings.TrimRight(string(msg), "\x00")
-			fmt.Printf("Query: %s\n", query)
+			logMessage(fmt.Sprintf("Query: %s", query))
 			handleQuery(conn, query)
 		case 'P':
 			handleParse(conn, msg)
@@ -172,14 +201,14 @@ func handleConnection(conn net.Conn) {
 		case 'D':
 			handleDescribe(conn, msg)
 		default:
-			fmt.Printf("Unknown message type: %c\n", msgType[0])
+			logMessage(fmt.Sprintf("Unknown message type: %c", msgType[0]))
 		}
 	}
 }
 
 func handleQuery(conn net.Conn, query string) {
 	translated := translateQuery(query)
-	fmt.Printf("Translated: %s\n", translated)
+	logMessage(fmt.Sprintf("Translated: %s", translated))
 
 	rows, err := db.Query(translated)
 	if err != nil {
@@ -208,6 +237,7 @@ func handleQuery(conn net.Conn, query string) {
 
 	sendCommandComplete(conn, "SELECT 1")
 	sendReadyForQuery(conn)
+	logMessage("Query completed")
 }
 
 func handleParse(conn net.Conn, msg []byte) {
@@ -215,12 +245,13 @@ func handleParse(conn net.Conn, msg []byte) {
 	queryEnd := bytes.IndexByte(msg[pos:], 0)
 	query := string(msg[pos : pos+queryEnd])
 
-	fmt.Printf("Parse: %s\n", query)
+	logMessage(fmt.Sprintf("Parse: %s", query))
 
 	parseComplete := make([]byte, 5)
 	parseComplete[0] = '1'
 	binary.BigEndian.PutUint32(parseComplete[1:5], 5)
 	conn.Write(parseComplete)
+	logMessage("Sent ParseComplete")
 }
 
 func handleBind(conn net.Conn, msg []byte) {
@@ -228,11 +259,13 @@ func handleBind(conn net.Conn, msg []byte) {
 	bindComplete[0] = '2'
 	binary.BigEndian.PutUint32(bindComplete[1:5], 5)
 	conn.Write(bindComplete)
+	logMessage("Sent BindComplete")
 }
 
 func handleExecute(conn net.Conn, msg []byte) {
 	sendCommandComplete(conn, "EXECUTE")
 	sendReadyForQuery(conn)
+	logMessage("Executed")
 }
 
 func handleClose(conn net.Conn, msg []byte) {
@@ -240,11 +273,13 @@ func handleClose(conn net.Conn, msg []byte) {
 	closeComplete[0] = '3'
 	binary.BigEndian.PutUint32(closeComplete[1:5], 5)
 	conn.Write(closeComplete)
+	logMessage("Sent CloseComplete")
 }
 
 func handleDescribe(conn net.Conn, msg []byte) {
 	columns := []string{"column1"}
 	sendRowDescription(conn, columns)
+	logMessage("Sent RowDescription")
 }
 
 func sendRowDescription(conn net.Conn, columns []string) {
@@ -259,11 +294,12 @@ func sendRowDescription(conn net.Conn, columns []string) {
 		buf.Write([]byte{0, 0, 0, 0, 0, 0, 0, 0})
 	}
 
-	length := buf.Len() - 1
+	payloadLen := buf.Len() - 5
 	buf2 := buf.Bytes()
-	binary.BigEndian.PutUint32(buf2[1:5], uint32(length))
+	binary.BigEndian.PutUint32(buf2[1:5], uint32(payloadLen))
 
 	conn.Write(buf2)
+	logMessage(fmt.Sprintf("Sent RowDescription for %d columns", len(columns)))
 }
 
 func sendDataRow(conn net.Conn, values []interface{}) {
@@ -284,11 +320,12 @@ func sendDataRow(conn net.Conn, values []interface{}) {
 		}
 	}
 
-	length := buf.Len() - 1
+	payloadLen := buf.Len() - 5
 	buf2 := buf.Bytes()
-	binary.BigEndian.PutUint32(buf2[1:5], uint32(length))
+	binary.BigEndian.PutUint32(buf2[1:5], uint32(payloadLen))
 
 	conn.Write(buf2)
+	logMessage(fmt.Sprintf("Sent DataRow with %d values", len(values)))
 }
 
 func sendErrorResponse(conn net.Conn, msg string) {
@@ -298,24 +335,26 @@ func sendErrorResponse(conn net.Conn, msg string) {
 	buf.WriteByte('C')
 	buf.Write([]byte(msg + "\x00"))
 
-	length := buf.Len() - 1
+	payloadLen := buf.Len() - 5
 	buf2 := buf.Bytes()
-	binary.BigEndian.PutUint32(buf2[1:5], uint32(length))
+	binary.BigEndian.PutUint32(buf2[1:5], uint32(payloadLen))
 
 	conn.Write(buf2)
+	logMessage(fmt.Sprintf("Sent Error: %s", msg))
 	sendReadyForQuery(conn)
 }
 
 func sendCommandComplete(conn net.Conn, cmd string) {
+	logMessage(fmt.Sprintf("Sending CommandComplete: %s", cmd))
 	buf := []byte(cmd + "\x00")
 	length := len(buf) + 4
 
 	result := make([]byte, length)
 	result[0] = 'C'
 	binary.BigEndian.PutUint32(result[1:5], uint32(length))
-	copy(result[5:], buf)
 
 	conn.Write(result)
+	logMessage("Sent CommandComplete")
 }
 
 func sendReadyForQuery(conn net.Conn) {
@@ -324,6 +363,7 @@ func sendReadyForQuery(conn net.Conn) {
 	binary.BigEndian.PutUint32(ready[1:5], 5)
 	ready[4] = 'I'
 	conn.Write(ready)
+	logMessage("Sent ReadyForQuery")
 }
 
 func translateQuery(sql string) string {
