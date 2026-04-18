@@ -1,432 +1,542 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"database/sql"
-	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
-	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-func logMessage(msg string) {
-	f, err := os.OpenFile("proxy.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer f.Close()
-	timestamp := time.Now().Format(time.RFC3339Nano)
-	logLine := fmt.Sprintf("[%s] %s\n", timestamp, msg)
-	f.WriteString(logLine)
-	os.Stdout.WriteString(logLine)
-}
-
-const DB_PATH = "C:\\Users\\as74t\\Documents\\infinite-pixels-database\\infinite-pixels.db"
-const PROXY_PORT = 5433
+const (
+	dbPath = "infinite-pixels.db"
+	port   = 5433
+)
 
 var db *sql.DB
 
+type prepStmt struct {
+	query     string
+	paramOIDs []uint32
+}
+
+type portal struct {
+	stmt   *prepStmt
+	params []interface{}
+}
+
 func main() {
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+
 	var err error
-
-	db, err = sql.Open("sqlite", DB_PATH)
+	db, err = sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_foreign_keys=on")
 	if err != nil {
-		log.Fatalf("Failed to open SQLite: %v", err)
+		log.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err = db.Ping(); err != nil {
+		log.Fatalf("ping db: %v", err)
 	}
 
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping SQLite: %v", err)
-	}
-
-	_, err = db.Exec("SELECT 1")
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		log.Fatalf("Failed to execute test query: %v", err)
+		log.Fatalf("listen: %v", err)
 	}
-
-	logMessage("SQLite database connected at: " + DB_PATH)
-
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", PROXY_PORT))
-	if err != nil {
-		log.Fatalf("Failed to listen on port %d: %v", PROXY_PORT, err)
-	}
-	defer listener.Close()
-
-	logMessage(fmt.Sprintf("PostgreSQL proxy listening on port %d", PROXY_PORT))
+	log.Printf("pg-proxy listening on :%d (db: %s)", port, dbPath)
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("Failed to accept connection: %v", err)
+			log.Printf("accept: %v", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleConn(conn)
 	}
 }
 
-func handleConnection(conn net.Conn) {
+func handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	logMessage("Client connected")
-
-	buf := make([]byte, 4)
-	_, err := conn.Read(buf)
+	// Dedicated SQLite connection per client preserves transaction state.
+	sqlConn, err := db.Conn(context.Background())
 	if err != nil {
-		logMessage(fmt.Sprintf("Failed to read startup: %v", err))
+		log.Printf("db.Conn: %v", err)
+		return
+	}
+	defer sqlConn.Close()
+
+	be := pgproto3.NewBackend(conn, conn)
+	if err := doStartup(be, conn); err != nil {
 		return
 	}
 
-	msgLen := int(binary.BigEndian.Uint32(buf))
-
-	// Check for SSL request (length 8, SSL code 80877103 = 0x58565243)
-	if msgLen == 8 && buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 8 {
-		logMessage("SSL request detected, responding with N")
-		conn.Write([]byte{'N'})
-		logMessage("Sent SSL denial")
-		_, err = conn.Read(buf)
-		if err != nil {
-			logMessage(fmt.Sprintf("Failed to read startup: %v", err))
-			return
-		}
-		msgLen = int(binary.BigEndian.Uint32(buf))
-	}
-
-	msg := make([]byte, msgLen-4)
-	_, err = conn.Read(msg)
-	if err != nil {
-		logMessage(fmt.Sprintf("Failed to read startup message: %v", err))
-		return
-	}
-
-	logMessage(fmt.Sprintf("Startup message length: %d", msgLen))
-	logMessage(fmt.Sprintf("Startup message bytes: %v", msg))
-	logMessage(fmt.Sprintf("Startup message (decoded): %q", string(msg)))
-
-	msg = bytes.TrimRight(msg, "\x00")
-	logMessage(fmt.Sprintf("Startup message (trimmed): %q", string(msg)))
-
-	authMsg := make([]byte, 9)
-	authMsg[0] = 'R'
-	binary.BigEndian.PutUint32(authMsg[1:5], 9)
-	binary.BigEndian.PutUint32(authMsg[5:9], 0)
-	logMessage(fmt.Sprintf("Sending Auth: %v", authMsg))
-	conn.Write(authMsg)
-	logMessage("Sent Auth OK")
-
-	// Send ParameterStatus (server_version)
-	serverVersion := "9.6.0"
-	versionBuf := new(bytes.Buffer)
-	versionBuf.WriteByte('S')
-	versionBuf.Write([]byte{0, 0, 0, 0})
-	versionBuf.WriteByte(0)
-	versionBuf.Write([]byte("server_version\x00"))
-	versionBuf.Write([]byte(serverVersion + "\x00"))
-	length := versionBuf.Len() - 5
-	versionData := versionBuf.Bytes()
-	binary.BigEndian.PutUint32(versionData[1:5], uint32(length))
-	logMessage(fmt.Sprintf("Sending ParameterStatus: %v", versionData))
-	conn.Write(versionData)
-	logMessage("Sent ParameterStatus")
-
-	// Send BackendKeyData (length = 8 bytes payload: 2 x 4-byte ints)
-	keyData := make([]byte, 13)
-	keyData[0] = 'K'
-	binary.BigEndian.PutUint32(keyData[1:5], 8)
-	binary.BigEndian.PutUint32(keyData[5:9], 12345)
-	binary.BigEndian.PutUint32(keyData[9:13], 67890)
-	logMessage(fmt.Sprintf("Sending BackendKeyData: %v", keyData))
-	conn.Write(keyData)
-	logMessage("Sent BackendKeyData")
-
-	// Send ReadyForQuery (transaction idle state)
-	ready := make([]byte, 6)
-	ready[0] = 'Z'
-	binary.BigEndian.PutUint32(ready[1:5], 5)
-	ready[5] = 'I'
-	logMessage(fmt.Sprintf("Sending ReadyForQuery: %v", ready))
-	conn.Write(ready)
-	logMessage("Sent ReadyForQuery, waiting for client messages")
-
-	logMessage("Startup complete, waiting for queries")
+	stmts := map[string]*prepStmt{}
+	portals := map[string]*portal{}
 
 	for {
-		msgType := make([]byte, 1)
-		n, err := conn.Read(msgType)
+		msg, err := be.Receive()
 		if err != nil {
-			logMessage(fmt.Sprintf("Error reading message type: %v, n=%d", err, n))
-			logMessage("Client disconnected")
 			return
 		}
-		logMessage(fmt.Sprintf("Received message type: %c (0x%02x)", msgType[0], msgType[0]))
-
-		if msgType[0] == 'X' {
-			logMessage("Client exited")
+		switch m := msg.(type) {
+		case *pgproto3.Terminate:
 			return
-		}
 
-		lenBuf := make([]byte, 4)
-		_, err = conn.Read(lenBuf)
-		if err != nil {
-			logMessage(fmt.Sprintf("Error reading length: %v", err))
-			return
-		}
-		msgLen := int(binary.BigEndian.Uint32(lenBuf))
-		logMessage(fmt.Sprintf("Message length: %d", msgLen))
+		case *pgproto3.Query:
+			simpleQuery(be, sqlConn, m.String)
 
-		msg := make([]byte, msgLen-4)
-		_, err = conn.Read(msg)
-		if err != nil {
-			logMessage(fmt.Sprintf("Error reading message: %v", err))
-			return
-		}
+		case *pgproto3.Parse:
+			stmts[m.Name] = &prepStmt{
+				query:     translateSQL(m.Query),
+				paramOIDs: m.ParameterOIDs,
+			}
+			be.Send(&pgproto3.ParseComplete{})
 
-		switch msgType[0] {
-		case 'Q':
-			query := strings.TrimRight(string(msg), "\x00")
-			logMessage(fmt.Sprintf("Query: %s", query))
-			handleQuery(conn, query)
-		case 'P':
-			handleParse(conn, msg)
-		case 'B':
-			handleBind(conn, msg)
-		case 'E':
-			handleExecute(conn, msg)
-		case 'C':
-			handleClose(conn, msg)
-		case 'D':
-			handleDescribe(conn, msg)
-		default:
-			logMessage(fmt.Sprintf("Unknown message type: %c", msgType[0]))
+		case *pgproto3.Bind:
+			stmt, ok := stmts[m.PreparedStatement]
+			if !ok {
+				sendErr(be, "unknown prepared statement: "+m.PreparedStatement)
+				rfq(be, 'I')
+				continue
+			}
+			portals[m.DestinationPortal] = &portal{
+				stmt:   stmt,
+				params: decodeParams(m.Parameters),
+			}
+			be.Send(&pgproto3.BindComplete{})
+
+		case *pgproto3.Describe:
+			if m.ObjectType == 'S' {
+				stmt, ok := stmts[m.Name]
+				if !ok {
+					sendErr(be, "unknown statement: "+m.Name)
+					be.Flush()
+					continue
+				}
+				be.Send(&pgproto3.ParameterDescription{ParameterOIDs: stmt.paramOIDs})
+			}
+			// Always NoData here; RowDescription is sent in Execute for SELECT.
+			be.Send(&pgproto3.NoData{})
+			be.Flush()
+
+		case *pgproto3.Execute:
+			p, ok := portals[m.Portal]
+			if !ok {
+				sendErr(be, "unknown portal: "+m.Portal)
+				rfq(be, 'I')
+				continue
+			}
+			execPortal(be, sqlConn, p)
+
+		case *pgproto3.Close:
+			if m.ObjectType == 'S' {
+				delete(stmts, m.Name)
+			} else {
+				delete(portals, m.Name)
+			}
+			be.Send(&pgproto3.CloseComplete{})
+			be.Flush()
+
+		case *pgproto3.Sync:
+			rfq(be, 'I')
+
+		case *pgproto3.Flush:
+			be.Flush()
 		}
 	}
 }
 
-func handleQuery(conn net.Conn, query string) {
-	translated := translateQuery(query)
-	logMessage(fmt.Sprintf("Translated: %s", translated))
-
-	rows, err := db.Query(translated)
+func doStartup(be *pgproto3.Backend, conn net.Conn) error {
+	msg, err := be.ReceiveStartupMessage()
 	if err != nil {
-		sendErrorResponse(conn, err.Error())
+		return err
+	}
+	if _, ok := msg.(*pgproto3.SSLRequest); ok {
+		conn.Write([]byte("N"))
+		msg, err = be.ReceiveStartupMessage()
+		if err != nil {
+			return err
+		}
+	}
+	sm, ok := msg.(*pgproto3.StartupMessage)
+	if !ok {
+		return fmt.Errorf("unexpected startup message %T", msg)
+	}
+	be.Send(&pgproto3.AuthenticationOk{})
+	be.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "15.0"})
+	be.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
+	be.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"})
+	be.Send(&pgproto3.BackendKeyData{ProcessID: uint32(os.Getpid()), SecretKey: []byte{0, 0, 0, 0}})
+	rfq(be, 'I')
+	log.Printf("connect: user=%s db=%s", sm.Parameters["user"], sm.Parameters["database"])
+	return nil
+}
+
+// simpleQuery handles the Query message (simple protocol, may be multi-statement).
+func simpleQuery(be *pgproto3.Backend, sqlConn *sql.Conn, raw string) {
+	for _, s := range splitStatements(raw) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		var failed bool
+		for _, t := range expandStatement(translateSQL(s)) {
+			if isNoOp(t) {
+				be.Send(&pgproto3.CommandComplete{CommandTag: []byte("OK")})
+				continue
+			}
+			if isSelect(t) {
+				failed = runSelect(be, sqlConn, t, nil, true)
+			} else {
+				failed = runDML(be, sqlConn, t, nil)
+			}
+			if failed {
+				break
+			}
+		}
+		if failed {
+			break // stop batch on error, matching real PG behaviour
+		}
+	}
+	rfq(be, 'I')
+	be.Flush()
+}
+
+func execPortal(be *pgproto3.Backend, sqlConn *sql.Conn, p *portal) {
+	q, args := expandParams(p.stmt.query, p.params)
+	if isNoOp(q) {
+		be.Send(&pgproto3.CommandComplete{CommandTag: []byte("OK")})
 		return
+	}
+	if isSelect(q) {
+		runSelect(be, sqlConn, q, args, true)
+	} else {
+		runDML(be, sqlConn, q, args)
+	}
+}
+
+func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}, sendHeader bool) (failed bool) {
+	rows, err := sqlConn.QueryContext(context.Background(), q, args...)
+	if err != nil {
+		log.Printf("query error: %v | sql: %s", err, q)
+		sendErr(be, err.Error())
+		return true
 	}
 	defer rows.Close()
 
-	columns, err := rows.Columns()
-	if err != nil {
-		sendErrorResponse(conn, err.Error())
-		return
+	cols, _ := rows.Columns()
+	if sendHeader {
+		fields := make([]pgproto3.FieldDescription, len(cols))
+		for i, c := range cols {
+			fields[i] = pgproto3.FieldDescription{
+				Name:         []byte(c),
+				DataTypeOID:  25, // text
+				DataTypeSize: -1,
+				TypeModifier: -1,
+			}
+		}
+		be.Send(&pgproto3.RowDescription{Fields: fields})
 	}
 
-	sendRowDescription(conn, columns)
-
+	vals := make([]interface{}, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	n := 0
 	for rows.Next() {
-		vals := make([]interface{}, len(columns))
-		ptrs := make([]interface{}, len(columns))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
 		rows.Scan(ptrs...)
-		sendDataRow(conn, vals)
+		row := make([][]byte, len(cols))
+		for i, v := range vals {
+			row[i] = toText(v)
+		}
+		be.Send(&pgproto3.DataRow{Values: row})
+		n++
+	}
+	be.Send(&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("SELECT %d", n))})
+	return false
+}
+
+func runDML(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}) (failed bool) {
+	res, err := sqlConn.ExecContext(context.Background(), q, args...)
+	if err != nil {
+		log.Printf("exec error: %v | sql: %s", err, q)
+		sendErr(be, err.Error())
+		return true
+	}
+	var n int64
+	u := strings.ToUpper(strings.TrimSpace(q))
+	if strings.HasPrefix(u, "INSERT") || strings.HasPrefix(u, "UPDATE") || strings.HasPrefix(u, "DELETE") {
+		n, _ = res.RowsAffected()
+	}
+	be.Send(&pgproto3.CommandComplete{CommandTag: []byte(cmdTag(q, n))})
+	return false
+}
+
+// ── SQL translation ────────────────────────────────────────────────────────
+
+var (
+	reAny = regexp.MustCompile(`(?i)=\s*ANY\s*\(\s*\$(\d+)\s*\)`)
+	reNum = regexp.MustCompile(`\$(\d+)`)
+)
+
+var reDeleteAlias = regexp.MustCompile(`(?i)^(DELETE\s+FROM\s+(\w+))\s+(\w+)\s+(WHERE\b)`)
+
+// translateSQL converts PostgreSQL DDL/DML to SQLite-compatible SQL.
+func translateSQL(q string) string {
+	q = sub(q, `(?i)\bBIGSERIAL\b`, "INTEGER")
+	q = sub(q, `(?i)\bSERIAL\b`, "INTEGER")
+	q = sub(q, `(?i)\bTIMESTAMPTZ\b`, "TEXT")
+	q = sub(q, `(?i)\bSMALLINT\b`, "INTEGER")
+	q = sub(q, `(?i)\bBOOLEAN\b`, "INTEGER")
+	q = sub(q, `(?i)\bVARCHAR\s*\(\d+\)`, "TEXT")
+	q = sub(q, `(?i)\bDECIMAL\s*\(\d+\s*,\s*\d+\)`, "REAL")
+	q = sub(q, `(?i)\bNOW\(\)`, "CURRENT_TIMESTAMP")
+	q = sub(q, `(?i)\bTRUE\b`, "1")
+	q = sub(q, `(?i)\bFALSE\b`, "0")
+	q = sub(q, `::\w+(\[\])?`, "")
+	q = sub(q, `(?i)\bADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b`, "ADD COLUMN")
+
+	// SQLite does not allow aliases on DELETE's target table.
+	// Rewrite: DELETE FROM tbl alias WHERE → DELETE FROM tbl WHERE
+	// then replace alias. with tbl. throughout.
+	if m := reDeleteAlias.FindStringSubmatch(q); m != nil {
+		table, alias := m[2], m[3]
+		// Strip the alias token between table name and WHERE
+		q = reDeleteAlias.ReplaceAllString(q, "$1 $4")
+		// Replace remaining alias. references with table.
+		q = regexp.MustCompile(`(?i)\b`+regexp.QuoteMeta(alias)+`\.`).
+			ReplaceAllString(q, table+".")
 	}
 
-	sendCommandComplete(conn, "SELECT 1")
-	sendReadyForQuery(conn)
-	logMessage("Query completed")
+	return q
 }
 
-func handleParse(conn net.Conn, msg []byte) {
-	pos := 0
-	queryEnd := bytes.IndexByte(msg[pos:], 0)
-	query := string(msg[pos : pos+queryEnd])
+var reMultiAddCol = regexp.MustCompile(`(?is)^(ALTER\s+TABLE\s+\w+)\s+(ADD\s+COLUMN\b.+)$`)
+var reAddColSplit = regexp.MustCompile(`(?i),\s*ADD\s+COLUMN\b`)
 
-	logMessage(fmt.Sprintf("Parse: %s", query))
-
-	parseComplete := make([]byte, 5)
-	parseComplete[0] = '1'
-	binary.BigEndian.PutUint32(parseComplete[1:5], 5)
-	conn.Write(parseComplete)
-	logMessage("Sent ParseComplete")
-}
-
-func handleBind(conn net.Conn, msg []byte) {
-	bindComplete := make([]byte, 5)
-	bindComplete[0] = '2'
-	binary.BigEndian.PutUint32(bindComplete[1:5], 5)
-	conn.Write(bindComplete)
-	logMessage("Sent BindComplete")
-}
-
-func handleExecute(conn net.Conn, msg []byte) {
-	sendCommandComplete(conn, "EXECUTE")
-	sendReadyForQuery(conn)
-	logMessage("Executed")
-}
-
-func handleClose(conn net.Conn, msg []byte) {
-	closeComplete := make([]byte, 5)
-	closeComplete[0] = '3'
-	binary.BigEndian.PutUint32(closeComplete[1:5], 5)
-	conn.Write(closeComplete)
-	logMessage("Sent CloseComplete")
-}
-
-func handleDescribe(conn net.Conn, msg []byte) {
-	columns := []string{"column1"}
-	sendRowDescription(conn, columns)
-	logMessage("Sent RowDescription")
-}
-
-func sendRowDescription(conn net.Conn, columns []string) {
-	buf := new(bytes.Buffer)
-	buf.WriteByte('T')
-	buf.Write([]byte{0, 0, 0, 0})
-	buf.WriteByte(0)
-	buf.WriteByte(byte(len(columns)))
-
-	for _, col := range columns {
-		buf.Write([]byte(col + "\x00"))
-		buf.Write([]byte{0, 0, 0, 0, 0, 0, 0, 0})
-	}
-
-	payloadLen := buf.Len() - 5
-	buf2 := buf.Bytes()
-	binary.BigEndian.PutUint32(buf2[1:5], uint32(payloadLen))
-
-	conn.Write(buf2)
-	logMessage(fmt.Sprintf("Sent RowDescription for %d columns", len(columns)))
-}
-
-func sendDataRow(conn net.Conn, values []interface{}) {
-	buf := new(bytes.Buffer)
-	buf.WriteByte('D')
-	buf.Write([]byte{0, 0, 0, 0})
-	buf.WriteByte(0)
-	buf.WriteByte(byte(len(values)))
-
-	for _, val := range values {
-		if val == nil {
-			buf.Write([]byte{255, 255, 255, 255})
-		} else {
-			valStr := fmt.Sprintf("%v", val)
-			valBuf := []byte(valStr)
-			buf.Write([]byte{byte(len(valStr) >> 24), byte(len(valStr) >> 16), byte(len(valStr) >> 8), byte(len(valStr))})
-			buf.Write(valBuf)
+// expandStatement splits a single translated statement into multiple if needed.
+// Currently handles ALTER TABLE with multiple ADD COLUMN clauses, which SQLite
+// requires as separate statements.
+func expandStatement(q string) []string {
+	if m := reMultiAddCol.FindStringSubmatch(q); m != nil {
+		prefix, rest := m[1], m[2]
+		// Split on ", ADD COLUMN" boundaries.
+		// Part 0 already contains "ADD COLUMN"; parts 1+ need it prepended.
+		parts := reAddColSplit.Split(rest, -1)
+		if len(parts) > 1 {
+			out := make([]string, len(parts))
+			for i, p := range parts {
+				if i == 0 {
+					out[i] = prefix + " " + strings.TrimSpace(p)
+				} else {
+					out[i] = prefix + " ADD COLUMN " + strings.TrimSpace(p)
+				}
+			}
+			return out
 		}
 	}
-
-	payloadLen := buf.Len() - 5
-	buf2 := buf.Bytes()
-	binary.BigEndian.PutUint32(buf2[1:5], uint32(payloadLen))
-
-	conn.Write(buf2)
-	logMessage(fmt.Sprintf("Sent DataRow with %d values", len(values)))
+	return []string{q}
 }
 
-func sendErrorResponse(conn net.Conn, msg string) {
-	buf := new(bytes.Buffer)
-	buf.WriteByte('E')
-	buf.Write([]byte{0, 0, 0, 0})
-	buf.WriteByte('C')
-	buf.Write([]byte(msg + "\x00"))
-
-	payloadLen := buf.Len() - 5
-	buf2 := buf.Bytes()
-	binary.BigEndian.PutUint32(buf2[1:5], uint32(payloadLen))
-
-	conn.Write(buf2)
-	logMessage(fmt.Sprintf("Sent Error: %s", msg))
-	sendReadyForQuery(conn)
+func sub(s, pattern, repl string) string {
+	return regexp.MustCompile(pattern).ReplaceAllString(s, repl)
 }
 
-func sendCommandComplete(conn net.Conn, cmd string) {
-	logMessage(fmt.Sprintf("Sending CommandComplete: %s", cmd))
-	buf := []byte(cmd + "\x00")
-	length := len(buf) + 4
-
-	result := make([]byte, length)
-	result[0] = 'C'
-	binary.BigEndian.PutUint32(result[1:5], uint32(length))
-
-	conn.Write(result)
-	logMessage("Sent CommandComplete")
+// expandParams replaces $N placeholders with ? and builds args.
+// Handles = ANY($N) by expanding the PostgreSQL array literal into IN (?,?,...).
+func expandParams(query string, params []interface{}) (string, []interface{}) {
+	var sb strings.Builder
+	var args []interface{}
+	i := 0
+	for i < len(query) {
+		// Match `= ANY($N)` starting at current position.
+		if loc := reAny.FindStringIndex(query[i:]); loc != nil && loc[0] == 0 {
+			m := reAny.FindStringSubmatch(query[i:])
+			n, _ := strconv.Atoi(m[1])
+			if n >= 1 && n <= len(params) {
+				elems := parsePGArray(fmt.Sprint(params[n-1]))
+				ph := strings.Repeat("?,", len(elems))
+				if len(ph) > 0 {
+					ph = ph[:len(ph)-1]
+				}
+				sb.WriteString("IN (")
+				sb.WriteString(ph)
+				sb.WriteByte(')')
+				for _, e := range elems {
+					args = append(args, e)
+				}
+			}
+			i += loc[1]
+			continue
+		}
+		// Match $N.
+		if query[i] == '$' {
+			j := i + 1
+			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+				j++
+			}
+			if j > i+1 {
+				n, _ := strconv.Atoi(query[i+1 : j])
+				if n >= 1 && n <= len(params) {
+					args = append(args, params[n-1])
+				} else {
+					args = append(args, nil)
+				}
+				sb.WriteByte('?')
+				i = j
+				continue
+			}
+		}
+		sb.WriteByte(query[i])
+		i++
+	}
+	return sb.String(), args
 }
 
-func sendReadyForQuery(conn net.Conn) {
-	ready := make([]byte, 5)
-	ready[0] = 'Z'
-	binary.BigEndian.PutUint32(ready[1:5], 5)
-	ready[4] = 'I'
-	conn.Write(ready)
-	logMessage("Sent ReadyForQuery")
+// parsePGArray parses a PostgreSQL array literal {a,b,c} into a string slice.
+func parsePGArray(s string) []string {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		if s != "" {
+			return []string{s}
+		}
+		return nil
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return nil
+	}
+	parts := strings.Split(inner, ",")
+	out := make([]string, len(parts))
+	for i, p := range parts {
+		out[i] = strings.Trim(strings.TrimSpace(p), `"`)
+	}
+	return out
 }
 
-func translateQuery(sql string) string {
-	translated := sql
+// decodeParams converts raw parameter bytes to Go string values (text protocol).
+func decodeParams(raw [][]byte) []interface{} {
+	out := make([]interface{}, len(raw))
+	for i, b := range raw {
+		if b != nil {
+			out[i] = string(b)
+		}
+	}
+	return out
+}
 
-	re := regexp.MustCompile(`\$\d+`)
-	translated = re.ReplaceAllString(translated, "?")
-
-	translated = strings.ReplaceAll(translated, "NOW()", "strftime('%s', 'now')")
-	translated = strings.ReplaceAll(translated, "TRUE", "1")
-	translated = strings.ReplaceAll(translated, "FALSE", "0")
-	translated = strings.ReplaceAll(translated, "SERIAL", "INTEGER")
-	translated = strings.ReplaceAll(translated, "BIGSERIAL", "INTEGER")
-	translated = strings.ReplaceAll(translated, "BOOLEAN", "INTEGER")
-	translated = strings.ReplaceAll(translated, "TIMESTAMPTZ", "INTEGER")
-	translated = strings.ReplaceAll(translated, "VARCHAR", "TEXT")
-	translated = strings.ReplaceAll(translated, "DECIMAL", "REAL")
-
-	translated = strings.ReplaceAll(translated, "::bigint", "")
-	translated = strings.ReplaceAll(translated, "::int", "")
-	translated = strings.ReplaceAll(translated, "::float", "")
-	translated = strings.ReplaceAll(translated, "::numeric", "")
-
-	translated = strings.ReplaceAll(translated, "pg_advisory_xact_lock", "sqlite_advisory_lock")
-
-	translated = strings.ReplaceAll(translated, "generate_series", "generate_series_mock")
-	translated = strings.ReplaceAll(translated, "unnest", "unnest_mock")
-
-	reInterval := regexp.MustCompile(`'(\d+)\s*(days?|hours?|minutes?)'`)
-	translated = reInterval.ReplaceAllStringFunc(translated, func(match string) string {
-		num := reInterval.ReplaceAllString(match, "$1")
-		unit := reInterval.ReplaceAllString(match, "$2")
-		switch unit {
-		case "day", "days":
-			return num + " * 86400"
-		case "hour", "hours":
-			return num + " * 3600"
-		case "minute", "minutes":
-			return num + " * 60"
+// splitStatements splits SQL on semicolons, skipping those inside string literals,
+// -- line comments, and /* block comments */.
+func splitStatements(sql string) []string {
+	var stmts []string
+	var sb strings.Builder
+	inStr, inLine, inBlock := false, false, false
+	i := 0
+	for i < len(sql) {
+		c := sql[i]
+		switch {
+		case !inStr && !inBlock && !inLine && c == '-' && i+1 < len(sql) && sql[i+1] == '-':
+			inLine = true
+			i += 2
+		case inLine && c == '\n':
+			inLine = false
+			sb.WriteByte(c)
+			i++
+		case inLine:
+			i++
+		case !inStr && !inLine && c == '/' && i+1 < len(sql) && sql[i+1] == '*':
+			inBlock = true
+			i += 2
+		case inBlock && c == '*' && i+1 < len(sql) && sql[i+1] == '/':
+			inBlock = false
+			i += 2
+		case inBlock:
+			i++
+		case c == '\'' && !inStr:
+			inStr = true
+			sb.WriteByte(c)
+			i++
+		case c == '\'' && inStr:
+			inStr = false
+			sb.WriteByte(c)
+			i++
+		case c == ';' && !inStr:
+			if s := strings.TrimSpace(sb.String()); s != "" {
+				stmts = append(stmts, s)
+			}
+			sb.Reset()
+			i++
 		default:
-			return num
+			sb.WriteByte(c)
+			i++
 		}
-	})
+	}
+	if s := strings.TrimSpace(sb.String()); s != "" {
+		stmts = append(stmts, s)
+	}
+	return stmts
+}
 
-	translated = strings.ReplaceAll(translated, "interval", "")
+// isNoOp returns true for PG-specific statements SQLite cannot run and should ignore.
+func isNoOp(q string) bool {
+	u := strings.ToUpper(strings.TrimSpace(q))
+	return strings.Contains(u, "PG_ADVISORY") ||
+		strings.Contains(u, "DROP CONSTRAINT") ||
+		strings.Contains(u, "ADD CONSTRAINT")
+}
 
-	reAny := regexp.MustCompile(`=ANY\(\$(\d+)\)`)
-	translated = reAny.ReplaceAllString(translated, "IN (SELECT value FROM json_each(CAST(? AS TEXT)))")
+var reSelect = regexp.MustCompile(`(?i)^\s*(SELECT|WITH|EXPLAIN)\b`)
 
-	reCastArrayInt := regexp.MustCompile(`\$(\d+)::int\[\]`)
-	translated = reCastArrayInt.ReplaceAllString(translated, "?")
+func isSelect(q string) bool { return reSelect.MatchString(q) }
 
-	reCastArrayBigInt := regexp.MustCompile(`\$(\d+)::bigint\[\]`)
-	translated = reCastArrayBigInt.ReplaceAllString(translated, "?")
+func toText(v interface{}) []byte {
+	if v == nil {
+		return nil
+	}
+	return []byte(fmt.Sprint(v))
+}
 
-	reCastArrayNumeric := regexp.MustCompile(`\$(\d+)::numeric\[\]`)
-	translated = reCastArrayNumeric.ReplaceAllString(translated, "?")
+func cmdTag(q string, n int64) string {
+	u := strings.ToUpper(strings.TrimSpace(q))
+	switch {
+	case strings.HasPrefix(u, "INSERT"):
+		return fmt.Sprintf("INSERT 0 %d", n)
+	case strings.HasPrefix(u, "UPDATE"):
+		return fmt.Sprintf("UPDATE %d", n)
+	case strings.HasPrefix(u, "DELETE"):
+		return fmt.Sprintf("DELETE %d", n)
+	case strings.HasPrefix(u, "BEGIN"):
+		return "BEGIN"
+	case strings.HasPrefix(u, "COMMIT"):
+		return "COMMIT"
+	case strings.HasPrefix(u, "ROLLBACK"):
+		return "ROLLBACK"
+	case strings.HasPrefix(u, "CREATE"):
+		return "CREATE TABLE"
+	case strings.HasPrefix(u, "ALTER"):
+		return "ALTER TABLE"
+	case strings.HasPrefix(u, "DROP"):
+		return "DROP TABLE"
+	default:
+		return "OK"
+	}
+}
 
-	reIntervalMath := regexp.MustCompile(`\((\d+)\s*\|\|\s*' minutes'\s*\)::interval`)
-	translated = reIntervalMath.ReplaceAllStringFunc(translated, func(match string) string {
-		num := reIntervalMath.ReplaceAllString(match, "$1")
-		return num + " * 60"
-	})
+func sendErr(be *pgproto3.Backend, msg string) {
+	log.Printf("pg-proxy error: %s", msg)
+	be.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "XX000", Message: msg})
+}
 
-	return translated
+func rfq(be *pgproto3.Backend, status byte) {
+	be.Send(&pgproto3.ReadyForQuery{TxStatus: status})
+	be.Flush()
 }
