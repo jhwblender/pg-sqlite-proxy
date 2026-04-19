@@ -1,23 +1,53 @@
 # pg-sqlite-proxy
 
-A PostgreSQL wire-protocol proxy that stores data in SQLite. Point any
-`libpq`-compatible client at it and it just works — no PostgreSQL installation
-required.
+> Use any PostgreSQL client against a local SQLite file — no Postgres installation required.
 
-Useful for local development, CI environments, and anywhere you want
-zero-dependency persistence without the overhead of a full Postgres server.
+`pg-sqlite-proxy` is a lightweight Go binary that speaks the full PostgreSQL wire protocol and stores your data in SQLite. Point `psql`, `node-postgres`, `Prisma`, `Sequelize`, or any `libpq`-compatible driver at it and it just works.
 
-## How it works
+```
+your app (pg driver) ──► pg-sqlite-proxy :5432 ──► data.db (SQLite)
+```
 
-The proxy speaks the PostgreSQL wire protocol (both simple-query and
-extended-query / prepared-statement protocols) and translates each query to
-SQLite before executing it. Results are returned in the same wire format a real
-Postgres server would use, including correct OIDs so numeric types arrive as
-numbers rather than strings in clients like node-postgres.
+**Why?** Running a full Postgres server for local dev or CI is heavy. SQLite is a single file, zero config, instant startup. `pg-sqlite-proxy` gives you the familiar pg connection string and protocol while keeping all that simplicity.
 
-SQL translation covers:
+---
 
-| PostgreSQL | SQLite |
+## Quick start
+
+```bash
+go install github.com/YOUR_USERNAME/pg-sqlite-proxy@latest
+pg-sqlite-proxy                      # listens on :5432, writes to data.db
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/YOUR_USERNAME/pg-sqlite-proxy
+cd pg-sqlite-proxy
+go build -o pg-sqlite-proxy .
+./pg-sqlite-proxy -db myapp.db -port 5433
+```
+
+Then point your app at it — no password needed:
+
+```
+DATABASE_URL=postgresql://user:pass@localhost:5433/myapp
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-db` | `data.db` | Path to the SQLite database file |
+| `-port` | `5432` | TCP port to listen on |
+
+---
+
+## What it translates
+
+The proxy rewrites PostgreSQL-flavoured SQL to SQLite-compatible SQL on the fly:
+
+| PostgreSQL | SQLite equivalent |
 |---|---|
 | `$1, $2, …` | `?, ?, …` |
 | `SERIAL` / `BIGSERIAL` | `INTEGER` |
@@ -39,40 +69,46 @@ SQL translation covers:
 | `DELETE FROM tbl alias WHERE …` | alias stripped |
 | `pg_advisory_xact_lock`, `ADD/DROP CONSTRAINT` | silently ignored |
 
-## Usage
+Both the **simple query** protocol and the **extended query / prepared-statement** protocol are supported.
+
+---
+
+## How it works
 
 ```
-go build -o pg-sqlite-proxy .
-./pg-sqlite-proxy [flags]
+Client                   pg-sqlite-proxy              SQLite
+  │                            │                        │
+  │── StartupMessage ─────────►│                        │
+  │◄─ AuthOk + RFQ ────────────│                        │
+  │                            │                        │
+  │── Query("SELECT …") ──────►│                        │
+  │                            │── translateSQL() ──────►│
+  │                            │◄─ rows ────────────────│
+  │◄─ RowDescription ──────────│                        │
+  │◄─ DataRow × N ─────────────│                        │
+  │◄─ CommandComplete + RFQ ───│                        │
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-db` | `data.db` | Path to the SQLite database file |
-| `-port` | `5432` | TCP port to listen on |
+- One SQLite connection is created per client connection, preserving transaction state across the session.
+- WAL mode is enabled for reliable concurrent reads; a 10 s busy timeout serialises concurrent writes.
+- Column OIDs are inferred from SQLite declared types and from the actual Go types of the first non-null value in each column, so clients like `node-postgres` receive numbers as numbers rather than strings.
 
-**Example** — listen on a non-privileged port with a named database file:
-
-```bash
-./pg-sqlite-proxy -db myapp.db -port 5433
-```
-
-Then point your app at it:
-
-```
-DATABASE_URL=postgresql://user:pass@localhost:5433/myapp
-```
-
-No password is required; the proxy accepts any credentials without checking them.
+---
 
 ## Known limitations
 
-- **Booleans** are stored as `0`/`1` integers, not `true`/`false`.
-- **Timestamps** are stored as ISO-8601 text strings (SQLite has no native timestamp type).
-- **`DISTINCT ON`** is silently stripped — the result set may contain duplicates if the app relied on it for deduplication.
-- **`ADD / DROP CONSTRAINT`** statements are silently ignored — constraints are not enforced.
-- **`FILTER (WHERE …)`** on aggregates requires SQLite ≥ 3.44 (bundled automatically via `modernc.org/sqlite`).
-- **Window functions** (`OVER (…)`) are not translated and will error if used.
-- **Transaction status** — the proxy tracks `BEGIN`/`COMMIT`/`ROLLBACK` to report the correct `ReadyForQuery` status byte, but does not inspect SQLite's internal transaction state.
-- **Single writer** — SQLite allows only one concurrent writer; concurrent writes are serialised via a 10 s busy timeout.
-- **Not for production** — no authentication, no TLS, no replication.
+- **Booleans** are stored as `0`/`1` integers.
+- **Timestamps** are stored as ISO-8601 text strings.
+- **`DISTINCT ON`** is silently stripped — results may contain duplicates if the application relied on it for deduplication.
+- **`ADD / DROP CONSTRAINT`** is silently ignored — constraints are not enforced.
+- **Window functions** (`OVER (…)`) are not translated and will produce an error.
+- **Single writer** — SQLite allows only one concurrent writer; concurrent writes queue behind a 10 s busy timeout.
+- **No authentication** — any credentials are accepted.
+- **No TLS.**
+- **Not for production** — this is a development / CI tool.
+
+---
+
+## License
+
+MIT
