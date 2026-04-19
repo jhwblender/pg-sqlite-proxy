@@ -37,7 +37,7 @@ func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
 	var err error
-	db, err = sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_foreign_keys=on")
+	db, err = sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000")
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
@@ -72,6 +72,8 @@ func handleConn(conn net.Conn) {
 		return
 	}
 	defer sqlConn.Close()
+	// Set busy timeout so concurrent writers wait rather than fail immediately.
+	sqlConn.ExecContext(context.Background(), "PRAGMA busy_timeout = 10000")
 
 	be := pgproto3.NewBackend(conn, conn)
 	if err := doStartup(be, conn); err != nil {
@@ -292,6 +294,13 @@ var reDeleteAlias = regexp.MustCompile(`(?i)^(DELETE\s+FROM\s+(\w+))\s+(\w+)\s+(
 
 // translateSQL converts PostgreSQL DDL/DML to SQLite-compatible SQL.
 func translateSQL(q string) string {
+	// PostgreSQL sequence functions have no SQLite equivalent; return a dummy value.
+	if strings.Contains(strings.ToLower(q), "setval(") ||
+		strings.Contains(strings.ToLower(q), "nextval(") ||
+		strings.Contains(strings.ToLower(q), "currval(") {
+		return "SELECT 1"
+	}
+
 	q = sub(q, `(?i)\bBIGSERIAL\b`, "INTEGER")
 	q = sub(q, `(?i)\bSERIAL\b`, "INTEGER")
 	q = sub(q, `(?i)\bTIMESTAMPTZ\b`, "TEXT")
@@ -300,10 +309,41 @@ func translateSQL(q string) string {
 	q = sub(q, `(?i)\bVARCHAR\s*\(\d+\)`, "TEXT")
 	q = sub(q, `(?i)\bDECIMAL\s*\(\d+\s*,\s*\d+\)`, "REAL")
 	q = sub(q, `(?i)\bNOW\(\)`, "CURRENT_TIMESTAMP")
+	q = sub(q, `(?i)\bILIKE\b`, "LIKE")
 	q = sub(q, `(?i)\bTRUE\b`, "1")
 	q = sub(q, `(?i)\bFALSE\b`, "0")
 	q = sub(q, `::\w+(\[\])?`, "")
 	q = sub(q, `(?i)\bADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b`, "ADD COLUMN")
+	// DISTINCT ON (cols) is PostgreSQL-only; strip it. Data is deduplicated by the app.
+	q = sub(q, `(?i)DISTINCT\s+ON\s*\([^)]+\)`, "")
+	// INTERVAL arithmetic: expr - INTERVAL 'N unit' → datetime(expr, '-N unit')
+	q = regexp.MustCompile(`(?i)(\w[\w.]*)\s*-\s*INTERVAL\s+'(\d+)\s+(days?|hours?|minutes?|seconds?)'`).
+		ReplaceAllStringFunc(q, func(m string) string {
+			parts := regexp.MustCompile(`(?i)(\w[\w.]*)\s*-\s*INTERVAL\s+'(\d+)\s+(days?|hours?|minutes?|seconds?)'`).FindStringSubmatch(m)
+			expr, n, unit := parts[1], parts[2], parts[3]
+			if strings.EqualFold(expr, "CURRENT_TIMESTAMP") {
+				expr = "'now'"
+			}
+			return fmt.Sprintf("datetime(%s, '-%s %s')", expr, n, unit)
+		})
+	// DATE_TRUNC('day', col) → date(col); other granularities use strftime
+	q = regexp.MustCompile(`(?i)DATE_TRUNC\s*\(\s*'(\w+)'\s*,\s*([^)]+)\)`).
+		ReplaceAllStringFunc(q, func(m string) string {
+			parts := regexp.MustCompile(`(?i)DATE_TRUNC\s*\(\s*'(\w+)'\s*,\s*([^)]+)\)`).FindStringSubmatch(m)
+			granularity, col := strings.ToLower(parts[1]), strings.TrimSpace(parts[2])
+			switch granularity {
+			case "day":
+				return fmt.Sprintf("date(%s)", col)
+			case "month":
+				return fmt.Sprintf("strftime('%%Y-%%m-01', %s)", col)
+			case "year":
+				return fmt.Sprintf("strftime('%%Y-01-01', %s)", col)
+			case "hour":
+				return fmt.Sprintf("strftime('%%Y-%%m-%%dT%%H:00:00', %s)", col)
+			default:
+				return fmt.Sprintf("date(%s)", col)
+			}
+		})
 
 	// SQLite does not allow aliases on DELETE's target table.
 	// Rewrite: DELETE FROM tbl alias WHERE → DELETE FROM tbl WHERE
@@ -495,8 +535,11 @@ func isNoOp(q string) bool {
 }
 
 var reSelect = regexp.MustCompile(`(?i)^\s*(SELECT|WITH|EXPLAIN)\b`)
+var reReturning = regexp.MustCompile(`(?i)\bRETURNING\b`)
 
-func isSelect(q string) bool { return reSelect.MatchString(q) }
+func isSelect(q string) bool {
+	return reSelect.MatchString(q) || reReturning.MatchString(q)
+}
 
 func toText(v interface{}) []byte {
 	if v == nil {
