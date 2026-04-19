@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -14,11 +15,6 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/jackc/pgx/v5/pgproto3"
-)
-
-const (
-	dbPath = "infinite-pixels.db"
-	port   = 5433
 )
 
 var db *sql.DB
@@ -36,8 +32,12 @@ type portal struct {
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
+	dbPath := flag.String("db", "data.db", "path to SQLite database file")
+	port   := flag.Int("port", 5432, "TCP port to listen on")
+	flag.Parse()
+
 	var err error
-	db, err = sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000")
+	db, err = sql.Open("sqlite", *dbPath+"?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000")
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
@@ -46,11 +46,11 @@ func main() {
 		log.Fatalf("ping db: %v", err)
 	}
 
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Printf("pg-proxy listening on :%d (db: %s)", port, dbPath)
+	log.Printf("pg-proxy listening on :%d (db: %s)", *port, *dbPath)
 
 	for {
 		conn, err := ln.Accept()
@@ -234,13 +234,56 @@ func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interfa
 	}
 	defer rows.Close()
 
-	cols, _ := rows.Columns()
+	rawCols, _ := rows.Columns()
+	cols := normalizeCols(rawCols)
+	colTypes, _ := rows.ColumnTypes()
+
+	// Buffer all rows so we can infer OIDs from actual Go types before sending
+	// RowDescription. SQLite returns empty type names for aggregate expressions
+	// (MIN, MAX, COUNT, etc.) so we can't rely on ColumnTypes alone.
+	ptrs := make([]interface{}, len(cols))
+	tmp := make([]interface{}, len(cols))
+	for i := range tmp {
+		ptrs[i] = &tmp[i]
+	}
+	var buffered [][]interface{}
+	for rows.Next() {
+		rows.Scan(ptrs...)
+		row := make([]interface{}, len(cols))
+		copy(row, tmp)
+		buffered = append(buffered, row)
+	}
+
+	// Determine OID per column: prefer declared type, fall back to Go type of first non-nil value.
+	oids := make([]uint32, len(cols))
+	for i := range cols {
+		oid := uint32(25)
+		if i < len(colTypes) {
+			oid = sqliteOID(colTypes[i].DatabaseTypeName())
+		}
+		if oid == 25 {
+			for _, row := range buffered {
+				if row[i] == nil {
+					continue
+				}
+				switch row[i].(type) {
+				case int64:
+					oid = 23 // int4 — node-postgres returns JS number (not bigint string)
+				case float64:
+					oid = 701 // float8
+				}
+				break
+			}
+		}
+		oids[i] = oid
+	}
+
 	if sendHeader {
 		fields := make([]pgproto3.FieldDescription, len(cols))
 		for i, c := range cols {
 			fields[i] = pgproto3.FieldDescription{
 				Name:         []byte(c),
-				DataTypeOID:  25, // text
+				DataTypeOID:  oids[i],
 				DataTypeSize: -1,
 				TypeModifier: -1,
 			}
@@ -248,22 +291,14 @@ func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interfa
 		be.Send(&pgproto3.RowDescription{Fields: fields})
 	}
 
-	vals := make([]interface{}, len(cols))
-	ptrs := make([]interface{}, len(cols))
-	for i := range vals {
-		ptrs[i] = &vals[i]
-	}
-	n := 0
-	for rows.Next() {
-		rows.Scan(ptrs...)
-		row := make([][]byte, len(cols))
-		for i, v := range vals {
-			row[i] = toText(v)
+	for _, row := range buffered {
+		encoded := make([][]byte, len(cols))
+		for i, v := range row {
+			encoded[i] = toText(v)
 		}
-		be.Send(&pgproto3.DataRow{Values: row})
-		n++
+		be.Send(&pgproto3.DataRow{Values: encoded})
 	}
-	be.Send(&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("SELECT %d", n))})
+	be.Send(&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("SELECT %d", len(buffered)))})
 	return false
 }
 
@@ -541,11 +576,52 @@ func isSelect(q string) bool {
 	return reSelect.MatchString(q) || reReturning.MatchString(q)
 }
 
+// sqliteOID maps a SQLite declared type name to a PostgreSQL OID so the pg
+// client parses numeric columns as JS numbers instead of strings.
+func sqliteOID(typeName string) uint32 {
+	t := strings.ToUpper(strings.TrimSpace(typeName))
+	switch {
+	case strings.Contains(t, "INT"):
+		return 23 // int4 — node-postgres returns JS number (not bigint string)
+	case strings.Contains(t, "REAL"),
+		strings.Contains(t, "FLOAT"),
+		strings.Contains(t, "DOUBLE"),
+		strings.Contains(t, "NUMERIC"),
+		strings.Contains(t, "DECIMAL"):
+		return 701 // float8
+	default:
+		return 25 // text
+	}
+}
+
+// normalizeCols cleans up SQLite column names to match PostgreSQL conventions.
+// e.g. SQLite returns "count(*)" where PostgreSQL returns "count".
+var reColFunc = regexp.MustCompile(`^(\w+)\(.*\)$`)
+
+func normalizeCols(cols []string) []string {
+	out := make([]string, len(cols))
+	for i, c := range cols {
+		if m := reColFunc.FindStringSubmatch(c); m != nil {
+			out[i] = m[1] // e.g. "count(*)" → "count"
+		} else {
+			out[i] = c
+		}
+	}
+	return out
+}
+
 func toText(v interface{}) []byte {
 	if v == nil {
 		return nil
 	}
-	return []byte(fmt.Sprint(v))
+	switch val := v.(type) {
+	case float64:
+		return []byte(strconv.FormatFloat(val, 'f', -1, 64))
+	case float32:
+		return []byte(strconv.FormatFloat(float64(val), 'f', -1, 32))
+	default:
+		return []byte(fmt.Sprint(val))
+	}
 }
 
 func cmdTag(q string, n int64) string {
