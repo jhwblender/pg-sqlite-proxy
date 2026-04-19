@@ -15,14 +15,14 @@ your app (pg driver) ──► pg-sqlite-proxy :5432 ──► data.db (SQLite)
 ## Quick start
 
 ```bash
-go install github.com/YOUR_USERNAME/pg-sqlite-proxy@latest
+go install github.com/jhwblender/pg-sqlite-proxy@latest
 pg-sqlite-proxy                      # listens on :5432, writes to data.db
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/pg-sqlite-proxy
+git clone https://github.com/jhwblender/pg-sqlite-proxy
 cd pg-sqlite-proxy
 go build -o pg-sqlite-proxy .
 ./pg-sqlite-proxy -db myapp.db -port 5433

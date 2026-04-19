@@ -1,4 +1,4 @@
-module pg-sqlite-proxy
+module github.com/jhwblender/pg-sqlite-proxy
 
 go 1.21
 
