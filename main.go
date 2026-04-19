@@ -80,8 +80,9 @@ func handleConn(conn net.Conn) {
 		return
 	}
 
-	stmts := map[string]*prepStmt{}
+	stmts   := map[string]*prepStmt{}
 	portals := map[string]*portal{}
+	inTx    := false // track whether client is inside an explicit transaction
 
 	for {
 		msg, err := be.Receive()
@@ -93,7 +94,7 @@ func handleConn(conn net.Conn) {
 			return
 
 		case *pgproto3.Query:
-			simpleQuery(be, sqlConn, m.String)
+			inTx = simpleQuery(be, sqlConn, m.String, inTx)
 
 		case *pgproto3.Parse:
 			stmts[m.Name] = &prepStmt{
@@ -106,7 +107,7 @@ func handleConn(conn net.Conn) {
 			stmt, ok := stmts[m.PreparedStatement]
 			if !ok {
 				sendErr(be, "unknown prepared statement: "+m.PreparedStatement)
-				rfq(be, 'I')
+				rfq(be, txStatus(inTx))
 				continue
 			}
 			portals[m.DestinationPortal] = &portal{
@@ -125,7 +126,7 @@ func handleConn(conn net.Conn) {
 				}
 				be.Send(&pgproto3.ParameterDescription{ParameterOIDs: stmt.paramOIDs})
 			}
-			// Always NoData here; RowDescription is sent in Execute for SELECT.
+			// RowDescription is sent in Execute for SELECT; NoData for everything else.
 			be.Send(&pgproto3.NoData{})
 			be.Flush()
 
@@ -133,10 +134,10 @@ func handleConn(conn net.Conn) {
 			p, ok := portals[m.Portal]
 			if !ok {
 				sendErr(be, "unknown portal: "+m.Portal)
-				rfq(be, 'I')
+				rfq(be, txStatus(inTx))
 				continue
 			}
-			execPortal(be, sqlConn, p)
+			inTx = execPortal(be, sqlConn, p, inTx)
 
 		case *pgproto3.Close:
 			if m.ObjectType == 'S' {
@@ -148,12 +149,19 @@ func handleConn(conn net.Conn) {
 			be.Flush()
 
 		case *pgproto3.Sync:
-			rfq(be, 'I')
+			rfq(be, txStatus(inTx))
 
 		case *pgproto3.Flush:
 			be.Flush()
 		}
 	}
+}
+
+func txStatus(inTx bool) byte {
+	if inTx {
+		return 'T'
+	}
+	return 'I'
 }
 
 func doStartup(be *pgproto3.Backend, conn net.Conn) error {
@@ -183,12 +191,21 @@ func doStartup(be *pgproto3.Backend, conn net.Conn) error {
 }
 
 // simpleQuery handles the Query message (simple protocol, may be multi-statement).
-func simpleQuery(be *pgproto3.Backend, sqlConn *sql.Conn, raw string) {
+// Returns the updated inTx state.
+func simpleQuery(be *pgproto3.Backend, sqlConn *sql.Conn, raw string, inTx bool) bool {
 	for _, s := range splitStatements(raw) {
 		s = strings.TrimSpace(s)
 		if s == "" {
 			continue
 		}
+		// Track explicit transaction boundaries.
+		u := strings.ToUpper(strings.TrimSpace(s))
+		if strings.HasPrefix(u, "BEGIN") {
+			inTx = true
+		} else if strings.HasPrefix(u, "COMMIT") || strings.HasPrefix(u, "ROLLBACK") {
+			inTx = false
+		}
+
 		var failed bool
 		for _, t := range expandStatement(translateSQL(s)) {
 			if isNoOp(t) {
@@ -208,21 +225,33 @@ func simpleQuery(be *pgproto3.Backend, sqlConn *sql.Conn, raw string) {
 			break // stop batch on error, matching real PG behaviour
 		}
 	}
-	rfq(be, 'I')
+	rfq(be, txStatus(inTx))
 	be.Flush()
+	return inTx
 }
 
-func execPortal(be *pgproto3.Backend, sqlConn *sql.Conn, p *portal) {
+// execPortal executes an extended-query portal. Returns updated inTx state.
+func execPortal(be *pgproto3.Backend, sqlConn *sql.Conn, p *portal, inTx bool) bool {
 	q, args := expandParams(p.stmt.query, p.params)
+
+	// Track explicit transaction boundaries in extended protocol too.
+	u := strings.ToUpper(strings.TrimSpace(q))
+	if strings.HasPrefix(u, "BEGIN") {
+		inTx = true
+	} else if strings.HasPrefix(u, "COMMIT") || strings.HasPrefix(u, "ROLLBACK") {
+		inTx = false
+	}
+
 	if isNoOp(q) {
 		be.Send(&pgproto3.CommandComplete{CommandTag: []byte("OK")})
-		return
+		return inTx
 	}
 	if isSelect(q) {
 		runSelect(be, sqlConn, q, args, true)
 	} else {
 		runDML(be, sqlConn, q, args)
 	}
+	return inTx
 }
 
 func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}, sendHeader bool) (failed bool) {
@@ -242,16 +271,25 @@ func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interfa
 	// RowDescription. SQLite returns empty type names for aggregate expressions
 	// (MIN, MAX, COUNT, etc.) so we can't rely on ColumnTypes alone.
 	ptrs := make([]interface{}, len(cols))
-	tmp := make([]interface{}, len(cols))
+	tmp  := make([]interface{}, len(cols))
 	for i := range tmp {
 		ptrs[i] = &tmp[i]
 	}
 	var buffered [][]interface{}
 	for rows.Next() {
-		rows.Scan(ptrs...)
+		if err := rows.Scan(ptrs...); err != nil {
+			log.Printf("scan error: %v", err)
+			sendErr(be, err.Error())
+			return true
+		}
 		row := make([]interface{}, len(cols))
 		copy(row, tmp)
 		buffered = append(buffered, row)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("rows error: %v", err)
+		sendErr(be, err.Error())
+		return true
 	}
 
 	// Determine OID per column: prefer declared type, fall back to Go type of first non-nil value.
@@ -320,65 +358,89 @@ func runDML(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{
 
 // ── SQL translation ────────────────────────────────────────────────────────
 
+// Pre-compiled regexps for translateSQL — compiled once at startup.
 var (
 	reAny = regexp.MustCompile(`(?i)=\s*ANY\s*\(\s*\$(\d+)\s*\)`)
 	reNum = regexp.MustCompile(`\$(\d+)`)
-)
 
-var reDeleteAlias = regexp.MustCompile(`(?i)^(DELETE\s+FROM\s+(\w+))\s+(\w+)\s+(WHERE\b)`)
+	reDeleteAlias = regexp.MustCompile(`(?i)^(DELETE\s+FROM\s+([\w.]+))\s+(\w+)\s+(WHERE\b)`)
+
+	reBigSerial    = regexp.MustCompile(`(?i)\bBIGSERIAL\b`)
+	reSerial       = regexp.MustCompile(`(?i)\bSERIAL\b`)
+	reTimestamptz  = regexp.MustCompile(`(?i)\bTIMESTAMPTZ\b`)
+	reSmallint     = regexp.MustCompile(`(?i)\bSMALLINT\b`)
+	reBoolean      = regexp.MustCompile(`(?i)\bBOOLEAN\b`)
+	reVarchar      = regexp.MustCompile(`(?i)\bVARCHAR\s*\(\d+\)`)
+	reDecimal      = regexp.MustCompile(`(?i)\bDECIMAL\s*\(\d+\s*,\s*\d+\)`)
+	reNow          = regexp.MustCompile(`(?i)\bNOW\(\)`)
+	reIlike        = regexp.MustCompile(`(?i)\bILIKE\b`)
+	reTrue         = regexp.MustCompile(`(?i)\bTRUE\b`)
+	reFalse        = regexp.MustCompile(`(?i)\bFALSE\b`)
+	reCast         = regexp.MustCompile(`::\w+(\[\])?`)
+	reAddColIfNot  = regexp.MustCompile(`(?i)\bADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b`)
+	reDistinctOn   = regexp.MustCompile(`(?i)DISTINCT\s+ON\s*\([^)]+\)`)
+	reInterval     = regexp.MustCompile(`(?i)([\w.'"]+)\s*-\s*INTERVAL\s+'(\d+)\s+(days?|hours?|minutes?|seconds?)'`)
+	reDateTrunc    = regexp.MustCompile(`(?i)DATE_TRUNC\s*\(\s*'(\w+)'\s*,\s*([^)]+)\)`)
+
+	reMultiAddCol = regexp.MustCompile(`(?is)^(ALTER\s+TABLE\s+\w+)\s+(ADD\s+COLUMN\b.+)$`)
+	reAddColSplit = regexp.MustCompile(`(?i),\s*ADD\s+COLUMN\b`)
+
+	reSelect    = regexp.MustCompile(`(?i)^\s*(SELECT|WITH|EXPLAIN)\b`)
+	reReturning = regexp.MustCompile(`(?i)\bRETURNING\b`)
+	reColFunc   = regexp.MustCompile(`^(\w+)\(.*\)$`)
+)
 
 // translateSQL converts PostgreSQL DDL/DML to SQLite-compatible SQL.
 func translateSQL(q string) string {
 	// PostgreSQL sequence functions have no SQLite equivalent; return a dummy value.
-	if strings.Contains(strings.ToLower(q), "setval(") ||
-		strings.Contains(strings.ToLower(q), "nextval(") ||
-		strings.Contains(strings.ToLower(q), "currval(") {
+	ql := strings.ToLower(q)
+	if strings.Contains(ql, "setval(") ||
+		strings.Contains(ql, "nextval(") ||
+		strings.Contains(ql, "currval(") {
 		return "SELECT 1"
 	}
 
-	q = sub(q, `(?i)\bBIGSERIAL\b`, "INTEGER")
-	q = sub(q, `(?i)\bSERIAL\b`, "INTEGER")
-	q = sub(q, `(?i)\bTIMESTAMPTZ\b`, "TEXT")
-	q = sub(q, `(?i)\bSMALLINT\b`, "INTEGER")
-	q = sub(q, `(?i)\bBOOLEAN\b`, "INTEGER")
-	q = sub(q, `(?i)\bVARCHAR\s*\(\d+\)`, "TEXT")
-	q = sub(q, `(?i)\bDECIMAL\s*\(\d+\s*,\s*\d+\)`, "REAL")
-	q = sub(q, `(?i)\bNOW\(\)`, "CURRENT_TIMESTAMP")
-	q = sub(q, `(?i)\bILIKE\b`, "LIKE")
-	q = sub(q, `(?i)\bTRUE\b`, "1")
-	q = sub(q, `(?i)\bFALSE\b`, "0")
-	q = sub(q, `::\w+(\[\])?`, "")
-	q = sub(q, `(?i)\bADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b`, "ADD COLUMN")
+	q = reBigSerial.ReplaceAllString(q, "INTEGER")
+	q = reSerial.ReplaceAllString(q, "INTEGER")
+	q = reTimestamptz.ReplaceAllString(q, "TEXT")
+	q = reSmallint.ReplaceAllString(q, "INTEGER")
+	q = reBoolean.ReplaceAllString(q, "INTEGER")
+	q = reVarchar.ReplaceAllString(q, "TEXT")
+	q = reDecimal.ReplaceAllString(q, "REAL")
+	q = reNow.ReplaceAllString(q, "CURRENT_TIMESTAMP")
+	q = reIlike.ReplaceAllString(q, "LIKE")
+	q = reTrue.ReplaceAllString(q, "1")
+	q = reFalse.ReplaceAllString(q, "0")
+	q = reCast.ReplaceAllString(q, "")
+	q = reAddColIfNot.ReplaceAllString(q, "ADD COLUMN")
 	// DISTINCT ON (cols) is PostgreSQL-only; strip it. Data is deduplicated by the app.
-	q = sub(q, `(?i)DISTINCT\s+ON\s*\([^)]+\)`, "")
+	q = reDistinctOn.ReplaceAllString(q, "")
 	// INTERVAL arithmetic: expr - INTERVAL 'N unit' → datetime(expr, '-N unit')
-	q = regexp.MustCompile(`(?i)(\w[\w.]*)\s*-\s*INTERVAL\s+'(\d+)\s+(days?|hours?|minutes?|seconds?)'`).
-		ReplaceAllStringFunc(q, func(m string) string {
-			parts := regexp.MustCompile(`(?i)(\w[\w.]*)\s*-\s*INTERVAL\s+'(\d+)\s+(days?|hours?|minutes?|seconds?)'`).FindStringSubmatch(m)
-			expr, n, unit := parts[1], parts[2], parts[3]
-			if strings.EqualFold(expr, "CURRENT_TIMESTAMP") {
-				expr = "'now'"
-			}
-			return fmt.Sprintf("datetime(%s, '-%s %s')", expr, n, unit)
-		})
+	q = reInterval.ReplaceAllStringFunc(q, func(m string) string {
+		parts := reInterval.FindStringSubmatch(m)
+		expr, n, unit := parts[1], parts[2], parts[3]
+		if strings.EqualFold(expr, "CURRENT_TIMESTAMP") {
+			expr = "'now'"
+		}
+		return fmt.Sprintf("datetime(%s, '-%s %s')", expr, n, unit)
+	})
 	// DATE_TRUNC('day', col) → date(col); other granularities use strftime
-	q = regexp.MustCompile(`(?i)DATE_TRUNC\s*\(\s*'(\w+)'\s*,\s*([^)]+)\)`).
-		ReplaceAllStringFunc(q, func(m string) string {
-			parts := regexp.MustCompile(`(?i)DATE_TRUNC\s*\(\s*'(\w+)'\s*,\s*([^)]+)\)`).FindStringSubmatch(m)
-			granularity, col := strings.ToLower(parts[1]), strings.TrimSpace(parts[2])
-			switch granularity {
-			case "day":
-				return fmt.Sprintf("date(%s)", col)
-			case "month":
-				return fmt.Sprintf("strftime('%%Y-%%m-01', %s)", col)
-			case "year":
-				return fmt.Sprintf("strftime('%%Y-01-01', %s)", col)
-			case "hour":
-				return fmt.Sprintf("strftime('%%Y-%%m-%%dT%%H:00:00', %s)", col)
-			default:
-				return fmt.Sprintf("date(%s)", col)
-			}
-		})
+	q = reDateTrunc.ReplaceAllStringFunc(q, func(m string) string {
+		parts := reDateTrunc.FindStringSubmatch(m)
+		granularity, col := strings.ToLower(parts[1]), strings.TrimSpace(parts[2])
+		switch granularity {
+		case "day":
+			return fmt.Sprintf("date(%s)", col)
+		case "month":
+			return fmt.Sprintf("strftime('%%Y-%%m-01', %s)", col)
+		case "year":
+			return fmt.Sprintf("strftime('%%Y-01-01', %s)", col)
+		case "hour":
+			return fmt.Sprintf("strftime('%%Y-%%m-%%dT%%H:00:00', %s)", col)
+		default:
+			return fmt.Sprintf("date(%s)", col)
+		}
+	})
 
 	// SQLite does not allow aliases on DELETE's target table.
 	// Rewrite: DELETE FROM tbl alias WHERE → DELETE FROM tbl WHERE
@@ -394,9 +456,6 @@ func translateSQL(q string) string {
 
 	return q
 }
-
-var reMultiAddCol = regexp.MustCompile(`(?is)^(ALTER\s+TABLE\s+\w+)\s+(ADD\s+COLUMN\b.+)$`)
-var reAddColSplit = regexp.MustCompile(`(?i),\s*ADD\s+COLUMN\b`)
 
 // expandStatement splits a single translated statement into multiple if needed.
 // Currently handles ALTER TABLE with multiple ADD COLUMN clauses, which SQLite
@@ -420,10 +479,6 @@ func expandStatement(q string) []string {
 		}
 	}
 	return []string{q}
-}
-
-func sub(s, pattern, repl string) string {
-	return regexp.MustCompile(pattern).ReplaceAllString(s, repl)
 }
 
 // expandParams replaces $N placeholders with ? and builds args.
@@ -569,9 +624,6 @@ func isNoOp(q string) bool {
 		strings.Contains(u, "ADD CONSTRAINT")
 }
 
-var reSelect = regexp.MustCompile(`(?i)^\s*(SELECT|WITH|EXPLAIN)\b`)
-var reReturning = regexp.MustCompile(`(?i)\bRETURNING\b`)
-
 func isSelect(q string) bool {
 	return reSelect.MatchString(q) || reReturning.MatchString(q)
 }
@@ -596,8 +648,6 @@ func sqliteOID(typeName string) uint32 {
 
 // normalizeCols cleans up SQLite column names to match PostgreSQL conventions.
 // e.g. SQLite returns "count(*)" where PostgreSQL returns "count".
-var reColFunc = regexp.MustCompile(`^(\w+)\(.*\)$`)
-
 func normalizeCols(cols []string) []string {
 	out := make([]string, len(cols))
 	for i, c := range cols {
