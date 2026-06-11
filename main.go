@@ -11,46 +11,37 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-var db *sql.DB
-
-type prepStmt struct {
-	query     string
-	paramOIDs []uint32
-}
-
-type portal struct {
-	stmt   *prepStmt
-	params []interface{}
-}
+var (
+	dbs          = make(map[string]*sql.DB)
+	dbsMu        sync.Mutex
+	singleDBPath string // non-empty: all connections use this one file
+)
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
-	dbPath := flag.String("db", "data.db", "path to SQLite database file")
+	dbPath := flag.String("db", "", "path to SQLite database file (single-db mode)")
 	port   := flag.Int("port", 5432, "TCP port to listen on")
 	flag.Parse()
 
-	var err error
-	db, err = sql.Open("sqlite", *dbPath+"?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000")
-	if err != nil {
-		log.Fatalf("open db: %v", err)
-	}
-	defer db.Close()
-	if err = db.Ping(); err != nil {
-		log.Fatalf("ping db: %v", err)
-	}
+	singleDBPath = *dbPath
 
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Printf("pg-proxy listening on :%d (db: %s)", *port, *dbPath)
+	if singleDBPath != "" {
+		log.Printf("pg-proxy listening on :%d (db: %s)", *port, singleDBPath)
+	} else {
+		log.Printf("pg-proxy listening on :%d (multi-db mode, dbs/ directory)", *port)
+	}
 
 	for {
 		conn, err := ln.Accept()
@@ -62,27 +53,72 @@ func main() {
 	}
 }
 
+type prepStmt struct {
+	query     string
+	paramOIDs []uint32
+}
+
+type portal struct {
+	stmt   *prepStmt
+	params []interface{}
+}
+
+func getDB(name string) (*sql.DB, error) {
+	dbsMu.Lock()
+	defer dbsMu.Unlock()
+
+	key := name
+	var path string
+	if singleDBPath != "" {
+		key = singleDBPath
+		path = singleDBPath + "?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000"
+	} else {
+		if err := os.MkdirAll("dbs", 0755); err != nil {
+			return nil, fmt.Errorf("create dir: %w", err)
+		}
+		path = fmt.Sprintf("dbs/%s.db?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000", name)
+	}
+
+	if db, ok := dbs[key]; ok {
+		return db, nil
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping: %w", err)
+	}
+	dbs[key] = db
+	return db, nil
+}
+
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	// Dedicated SQLite connection per client preserves transaction state.
-	sqlConn, err := db.Conn(context.Background())
+	be := pgproto3.NewBackend(conn, conn)
+	dbName, err := doStartup(be, conn)
 	if err != nil {
-		log.Printf("db.Conn: %v", err)
+		return
+	}
+
+	sqlDB, err := getDB(dbName)
+	if err != nil {
+		sendErr(be, "cannot open database: "+err.Error())
+		return
+	}
+
+	sqlConn, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		sendErr(be, "db.Conn: "+err.Error())
 		return
 	}
 	defer sqlConn.Close()
-	// Set busy timeout so concurrent writers wait rather than fail immediately.
-	sqlConn.ExecContext(context.Background(), "PRAGMA busy_timeout = 10000")
-
-	be := pgproto3.NewBackend(conn, conn)
-	if err := doStartup(be, conn); err != nil {
-		return
-	}
 
 	stmts   := map[string]*prepStmt{}
 	portals := map[string]*portal{}
-	inTx    := false // track whether client is inside an explicit transaction
+	inTx    := false
 
 	for {
 		msg, err := be.Receive()
@@ -164,30 +200,35 @@ func txStatus(inTx bool) byte {
 	return 'I'
 }
 
-func doStartup(be *pgproto3.Backend, conn net.Conn) error {
+func doStartup(be *pgproto3.Backend, conn net.Conn) (string, error) {
 	msg, err := be.ReceiveStartupMessage()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if _, ok := msg.(*pgproto3.SSLRequest); ok {
-		conn.Write([]byte("N"))
+		if _, err := conn.Write([]byte("N")); err != nil {
+			return "", err
+		}
 		msg, err = be.ReceiveStartupMessage()
 		if err != nil {
-			return err
+			return "", err
 		}
 	}
 	sm, ok := msg.(*pgproto3.StartupMessage)
 	if !ok {
-		return fmt.Errorf("unexpected startup message %T", msg)
+		return "", fmt.Errorf("unexpected startup message %T", msg)
 	}
+
+	dbName := sm.Parameters["database"]
+	log.Printf("connect: user=%s db=%s", sm.Parameters["user"], dbName)
+
 	be.Send(&pgproto3.AuthenticationOk{})
 	be.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "15.0"})
 	be.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
 	be.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"})
 	be.Send(&pgproto3.BackendKeyData{ProcessID: uint32(os.Getpid()), SecretKey: []byte{0, 0, 0, 0}})
 	rfq(be, 'I')
-	log.Printf("connect: user=%s db=%s", sm.Parameters["user"], sm.Parameters["database"])
-	return nil
+	return dbName, nil
 }
 
 // simpleQuery handles the Query message (simple protocol, may be multi-statement).
@@ -198,7 +239,6 @@ func simpleQuery(be *pgproto3.Backend, sqlConn *sql.Conn, raw string, inTx bool)
 		if s == "" {
 			continue
 		}
-		// Track explicit transaction boundaries.
 		u := strings.ToUpper(strings.TrimSpace(s))
 		if strings.HasPrefix(u, "BEGIN") {
 			inTx = true
@@ -222,7 +262,7 @@ func simpleQuery(be *pgproto3.Backend, sqlConn *sql.Conn, raw string, inTx bool)
 			}
 		}
 		if failed {
-			break // stop batch on error, matching real PG behaviour
+			break
 		}
 	}
 	rfq(be, txStatus(inTx))
@@ -230,11 +270,9 @@ func simpleQuery(be *pgproto3.Backend, sqlConn *sql.Conn, raw string, inTx bool)
 	return inTx
 }
 
-// execPortal executes an extended-query portal. Returns updated inTx state.
 func execPortal(be *pgproto3.Backend, sqlConn *sql.Conn, p *portal, inTx bool) bool {
 	q, args := expandParams(p.stmt.query, p.params)
 
-	// Track explicit transaction boundaries in extended protocol too.
 	u := strings.ToUpper(strings.TrimSpace(q))
 	if strings.HasPrefix(u, "BEGIN") {
 		inTx = true
@@ -388,6 +426,13 @@ var (
 	reSelect    = regexp.MustCompile(`(?i)^\s*(SELECT|WITH|EXPLAIN)\b`)
 	reReturning = regexp.MustCompile(`(?i)\bRETURNING\b`)
 	reColFunc   = regexp.MustCompile(`^(\w+)\(.*\)$`)
+
+	// COUNT(DISTINCT (col1, col2)) is a PostgreSQL row-value expression; SQLite
+	// doesn't support it. Rewrite to COUNT(DISTINCT col1 || '|' || col2).
+	reCountDistinctTuple = regexp.MustCompile(`(?i)COUNT\s*\(\s*DISTINCT\s*\(\s*([^)]+)\s*\)\s*\)`)
+
+	// generate_series(start, end) [AS] alias → inline recursive CTE subquery.
+	reGenerateSeries = regexp.MustCompile(`(?i)\bgenerate_series\s*\(([^)]+)\)\s*(?:AS\s+)?(\w+)`)
 )
 
 // translateSQL converts PostgreSQL DDL/DML to SQLite-compatible SQL.
@@ -442,6 +487,19 @@ func translateSQL(q string) string {
 		}
 	})
 
+	// COUNT(DISTINCT (col1, col2)) → COUNT(DISTINCT col1 || '|' || col2)
+	q = reCountDistinctTuple.ReplaceAllStringFunc(q, func(m string) string {
+		parts := reCountDistinctTuple.FindStringSubmatch(m)
+		cols := strings.Split(parts[1], ",")
+		for i := range cols {
+			cols[i] = strings.TrimSpace(cols[i])
+		}
+		return "COUNT(DISTINCT " + strings.Join(cols, " || '|' || ") + ")"
+	})
+
+	// generate_series(start, end) [AS] alias → inline recursive CTE subquery.
+	q = translateGenerateSeries(q)
+
 	// SQLite does not allow aliases on DELETE's target table.
 	// Rewrite: DELETE FROM tbl alias WHERE → DELETE FROM tbl WHERE
 	// then replace alias. with tbl. throughout.
@@ -455,6 +513,42 @@ func translateSQL(q string) string {
 	}
 
 	return q
+}
+
+// translateGenerateSeries rewrites each generate_series(start, end) [AS] alias
+// into an inline recursive CTE subquery that SQLite can execute:
+//
+//	(WITH RECURSIVE _alias(n) AS
+//	   (SELECT start UNION ALL SELECT n+1 FROM _alias WHERE n < end)
+//	 SELECT n AS alias FROM _alias) AS alias
+//
+// The internal CTE uses a prefixed name to avoid shadowing the outer alias.
+// This handles both the CROSS JOIN grid pattern and the UNION ALL border pattern
+// without requiring restructuring of the surrounding query.
+func translateGenerateSeries(q string) string {
+	if !strings.Contains(strings.ToLower(q), "generate_series") {
+		return q
+	}
+	return reGenerateSeries.ReplaceAllStringFunc(q, func(m string) string {
+		subs := reGenerateSeries.FindStringSubmatch(m)
+		args, alias := subs[1], subs[2]
+
+		commaIdx := strings.Index(args, ",")
+		if commaIdx < 0 {
+			return m // unexpected form, leave unchanged
+		}
+		start := strings.TrimSpace(args[:commaIdx])
+		end := strings.TrimSpace(args[commaIdx+1:])
+		internal := "_" + alias
+
+		// generate_series is inclusive on both ends; the CTE achieves this because
+		// the recursion stops when n reaches end (WHERE n < end stops *after* end
+		// is already in the result set from the previous step).
+		return fmt.Sprintf(
+			"(WITH RECURSIVE %s(n) AS (SELECT %s UNION ALL SELECT n+1 FROM %s WHERE n < %s) SELECT n AS %s FROM %s) AS %s",
+			internal, start, internal, end, alias, internal, alias,
+		)
+	})
 }
 
 // expandStatement splits a single translated statement into multiple if needed.
