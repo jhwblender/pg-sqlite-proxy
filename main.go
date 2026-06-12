@@ -71,12 +71,12 @@ func getDB(name string) (*sql.DB, error) {
 	var path string
 	if singleDBPath != "" {
 		key = singleDBPath
-		path = singleDBPath + "?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000"
+		path = singleDBPath
 	} else {
 		if err := os.MkdirAll("dbs", 0755); err != nil {
 			return nil, fmt.Errorf("create dir: %w", err)
 		}
-		path = fmt.Sprintf("dbs/%s.db?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000", name)
+		path = fmt.Sprintf("dbs/%s.db", name)
 	}
 
 	if db, ok := dbs[key]; ok {
@@ -89,6 +89,19 @@ func getDB(name string) (*sql.DB, error) {
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping: %w", err)
+	}
+	// Apply PRAGMAs that the modernc.org/sqlite driver ignores in the DSN.
+	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("journal_mode WAL: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("foreign_keys ON: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA busy_timeout = 10000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("busy_timeout: %w", err)
 	}
 	dbs[key] = db
 	return db, nil
@@ -115,6 +128,8 @@ func handleConn(conn net.Conn) {
 		return
 	}
 	defer sqlConn.Close()
+
+	sqlConn.ExecContext(context.Background(), "PRAGMA busy_timeout = 10000")
 
 	stmts   := map[string]*prepStmt{}
 	portals := map[string]*portal{}
@@ -175,45 +190,30 @@ func handleConn(conn net.Conn) {
 			}
 			inTx = execPortal(be, sqlConn, p, inTx)
 
-		case *pgproto3.Close:
-			if m.ObjectType == 'S' {
-				delete(stmts, m.Name)
-			} else {
-				delete(portals, m.Name)
-			}
-			be.Send(&pgproto3.CloseComplete{})
-			be.Flush()
-
 		case *pgproto3.Sync:
 			rfq(be, txStatus(inTx))
-
-		case *pgproto3.Flush:
 			be.Flush()
 		}
+		be.Flush()
 	}
-}
-
-func txStatus(inTx bool) byte {
-	if inTx {
-		return 'T'
-	}
-	return 'I'
 }
 
 func doStartup(be *pgproto3.Backend, conn net.Conn) (string, error) {
-	msg, err := be.ReceiveStartupMessage()
-	if err != nil {
-		return "", err
-	}
-	if _, ok := msg.(*pgproto3.SSLRequest); ok {
-		if _, err := conn.Write([]byte("N")); err != nil {
-			return "", err
-		}
+	var msg pgproto3.FrontendMessage
+	for {
+		var err error
 		msg, err = be.ReceiveStartupMessage()
 		if err != nil {
 			return "", err
 		}
+		switch msg.(type) {
+		case *pgproto3.SSLRequest:
+			conn.Write([]byte("N"))
+		default:
+			goto done
+		}
 	}
+done:
 	sm, ok := msg.(*pgproto3.StartupMessage)
 	if !ok {
 		return "", fmt.Errorf("unexpected startup message %T", msg)
@@ -228,6 +228,7 @@ func doStartup(be *pgproto3.Backend, conn net.Conn) (string, error) {
 	be.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"})
 	be.Send(&pgproto3.BackendKeyData{ProcessID: uint32(os.Getpid()), SecretKey: []byte{0, 0, 0, 0}})
 	rfq(be, 'I')
+	be.Flush()
 	return dbName, nil
 }
 
@@ -295,7 +296,7 @@ func execPortal(be *pgproto3.Backend, sqlConn *sql.Conn, p *portal, inTx bool) b
 func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}, sendHeader bool) (failed bool) {
 	rows, err := sqlConn.QueryContext(context.Background(), q, args...)
 	if err != nil {
-		log.Printf("query error: %v | sql: %s", err, q)
+		log.Printf("query error: %v | sql: %s | args: %v", err, q, args)
 		sendErr(be, err.Error())
 		return true
 	}
@@ -358,78 +359,143 @@ func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interfa
 		fields := make([]pgproto3.FieldDescription, len(cols))
 		for i, c := range cols {
 			fields[i] = pgproto3.FieldDescription{
-				Name:         []byte(c),
-				DataTypeOID:  oids[i],
-				DataTypeSize: -1,
-				TypeModifier: -1,
+				Name:                 []byte(c),
+				TableOID:             0,
+				TableAttributeNumber: 0,
+				DataTypeOID:          oids[i],
+				DataTypeSize:         -1,
+				TypeModifier:         -1,
+				Format:               0,
 			}
 		}
 		be.Send(&pgproto3.RowDescription{Fields: fields})
 	}
 
 	for _, row := range buffered {
-		encoded := make([][]byte, len(cols))
+		vals := make([][]byte, len(cols))
 		for i, v := range row {
-			encoded[i] = toText(v)
+			if v == nil {
+				vals[i] = nil // PostgreSQL NULL
+			} else {
+				vals[i] = []byte(fmt.Sprint(v))
+			}
 		}
-		be.Send(&pgproto3.DataRow{Values: encoded})
+		be.Send(&pgproto3.DataRow{Values: vals})
 	}
-	be.Send(&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("SELECT %d", len(buffered)))})
+
+	be.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT ")})
 	return false
 }
 
-func runDML(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}) (failed bool) {
+func runDML(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}) bool {
 	res, err := sqlConn.ExecContext(context.Background(), q, args...)
 	if err != nil {
 		log.Printf("exec error: %v | sql: %s", err, q)
 		sendErr(be, err.Error())
 		return true
 	}
-	var n int64
-	u := strings.ToUpper(strings.TrimSpace(q))
-	if strings.HasPrefix(u, "INSERT") || strings.HasPrefix(u, "UPDATE") || strings.HasPrefix(u, "DELETE") {
-		n, _ = res.RowsAffected()
+
+	// Try to get rows affected.
+	tag := "OK"
+	if ra, err := res.RowsAffected(); err == nil {
+		tag = fmt.Sprintf("%d", ra)
 	}
-	be.Send(&pgproto3.CommandComplete{CommandTag: []byte(cmdTag(q, n))})
+	be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
 	return false
 }
 
-// ── SQL translation ────────────────────────────────────────────────────────
+func rfq(be *pgproto3.Backend, status byte) {
+	be.Send(&pgproto3.ReadyForQuery{TxStatus: status})
+}
 
-// Pre-compiled regexps for translateSQL — compiled once at startup.
+func txStatus(inTx bool) byte {
+	if inTx {
+		return 'T'
+	}
+	return 'I'
+}
+
+func sendErr(be *pgproto3.Backend, msg string) {
+	be.Send(&pgproto3.ErrorResponse{Message: msg})
+}
+
+// sqliteOID maps SQLite declared type names to PostgreSQL OIDs.
+func sqliteOID(declared string) uint32 {
+	u := strings.ToUpper(declared)
+	switch u {
+	case "INTEGER":
+		return 23 // int4
+	case "REAL", "NUMERIC", "DOUBLE", "FLOAT":
+		return 701 // float8
+	case "BLOB":
+		return 17 // bytea
+	case "TEXT", "VARCHAR", "CHAR", "CLOB":
+		return 25 // text
+	case "NULL":
+		return 25 // text (fallback)
+	default:
+		return 25 // text
+	}
+}
+
+func isNoOp(q string) bool {
+	u := strings.ToUpper(strings.TrimSpace(q))
+	return u == "" ||
+		strings.HasPrefix(u, "SET ") ||
+		strings.HasPrefix(u, "SHOW ") ||
+		strings.HasPrefix(u, "COMMIT") ||
+		strings.HasPrefix(u, "ROLLBACK") ||
+		strings.HasPrefix(u, "BEGIN")
+}
+
+func isSelect(q string) bool {
+	u := strings.ToUpper(strings.TrimSpace(q))
+	return strings.HasPrefix(u, "SELECT")
+}
+
+// normalizeCols rewrites fully-qualified column references to bare names.
+func normalizeCols(cols []string) []string {
+	out := make([]string, len(cols))
+	for i, c := range cols {
+		idx := strings.LastIndex(c, ".")
+		if idx >= 0 {
+			out[i] = c[idx+1:]
+		} else {
+			out[i] = c
+		}
+	}
+	return out
+}
+
 var (
-	reAny = regexp.MustCompile(`(?i)=\s*ANY\s*\(\s*\$(\d+)\s*\)`)
-	reNum = regexp.MustCompile(`\$(\d+)`)
+	// reInterval: e.g. CURRENT_TIMESTAMP - INTERVAL '24 hour' or col - INTERVAL '1 day'
+	reInterval = regexp.MustCompile(`(?i)([\w.]+)\s+-\s+INTERVAL\s+'(\d+)\s+(\w+)'`)
 
-	reDeleteAlias = regexp.MustCompile(`(?i)^(DELETE\s+FROM\s+([\w.]+))\s+(\w+)\s+(WHERE\b)`)
+	reDateTrunc = regexp.MustCompile(`(?i)DATE_TRUNC\s*\(\s*'([^']+)'\s*,\s*([^)]+)\s*\)`)
 
-	reBigSerial    = regexp.MustCompile(`(?i)\bBIGSERIAL\b`)
-	reSerial       = regexp.MustCompile(`(?i)\bSERIAL\b`)
-	reTimestamptz  = regexp.MustCompile(`(?i)\bTIMESTAMPTZ\b`)
-	reSmallint     = regexp.MustCompile(`(?i)\bSMALLINT\b`)
-	reBoolean      = regexp.MustCompile(`(?i)\bBOOLEAN\b`)
-	reVarchar      = regexp.MustCompile(`(?i)\bVARCHAR\s*\(\d+\)`)
-	reDecimal      = regexp.MustCompile(`(?i)\bDECIMAL\s*\(\d+\s*,\s*\d+\)`)
-	reNow          = regexp.MustCompile(`(?i)\bNOW\(\)`)
-	reIlike        = regexp.MustCompile(`(?i)\bILIKE\b`)
-	reTrue         = regexp.MustCompile(`(?i)\bTRUE\b`)
-	reFalse        = regexp.MustCompile(`(?i)\bFALSE\b`)
-	reCast         = regexp.MustCompile(`::\w+(\[\])?`)
-	reAddColIfNot  = regexp.MustCompile(`(?i)\bADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b`)
-	reDistinctOn   = regexp.MustCompile(`(?i)DISTINCT\s+ON\s*\([^)]+\)`)
-	reInterval     = regexp.MustCompile(`(?i)([\w.'"]+)\s*-\s*INTERVAL\s+'(\d+)\s+(days?|hours?|minutes?|seconds?)'`)
-	reDateTrunc    = regexp.MustCompile(`(?i)DATE_TRUNC\s*\(\s*'(\w+)'\s*,\s*([^)]+)\)`)
-
-	reMultiAddCol = regexp.MustCompile(`(?is)^(ALTER\s+TABLE\s+\w+)\s+(ADD\s+COLUMN\b.+)$`)
-	reAddColSplit = regexp.MustCompile(`(?i),\s*ADD\s+COLUMN\b`)
-
-	reSelect    = regexp.MustCompile(`(?i)^\s*(SELECT|WITH|EXPLAIN)\b`)
-	reReturning = regexp.MustCompile(`(?i)\bRETURNING\b`)
-	reColFunc   = regexp.MustCompile(`^(\w+)\(.*\)$`)
-
-	// COUNT(DISTINCT (col1, col2)) is a PostgreSQL row-value expression; SQLite
-	// doesn't support it. Rewrite to COUNT(DISTINCT col1 || '|' || col2).
-	reCountDistinctTuple = regexp.MustCompile(`(?i)COUNT\s*\(\s*DISTINCT\s*\(\s*([^)]+)\s*\)\s*\)`)
+	reMultiAddCol   = regexp.MustCompile(`(?i)^(ALTER\s+TABLE\s+\w+\s+ADD\s+COLUMN\s+.+)`)
+	reAddColSplit   = regexp.MustCompile(`(?i),\s*ADD\s+COLUMN\s+`)
+	reAddColIfNot   = regexp.MustCompile(`(?i)\bIF\s+NOT\s+EXISTS\b`)
+	reBigSerial     = regexp.MustCompile(`(?i)\bBIGSERIAL\b`)
+	reSerial        = regexp.MustCompile(`(?i)\bSERIAL\b`)
+	reTimestamptz   = regexp.MustCompile(`(?i)\bTIMESTAMPTZ\b`)
+	reSmallint      = regexp.MustCompile(`(?i)\bSMALLINT\b`)
+	reBoolean       = regexp.MustCompile(`(?i)\bBOOLEAN\b`)
+	reVarchar       = regexp.MustCompile(`(?i)\bVARCHAR\b`)
+	reDecimal       = regexp.MustCompile(`(?i)\bDECIMAL\b`)
+	reNow           = regexp.MustCompile(`(?i)\bNOW\s*\(\s*\)`)
+	reIlike         = regexp.MustCompile(`(?i)\bILIKE\b`)
+	reTrue          = regexp.MustCompile(`(?i)\bTRUE\b`)
+	reFalse         = regexp.MustCompile(`(?i)\bFALSE\b`)
+	reCast          = regexp.MustCompile(`(?i)::\w+(?:\[\])?`)
+	reDistinctOn    = regexp.MustCompile(`(?i)DISTINCT\s+ON\s*\([^)]+\)`)
+	reDeleteAlias   = regexp.MustCompile(`(?i)^(DELETE\s+FROM\s+(\w+))\s+(\w+)\s+(WHERE.*)`)
+	reCountDistinctTuple = regexp.MustCompile(`(?i)COUNT\s*\(\s*DISTINCT\s*\(([^)]+)\)\s*\)`)
+	reAny           = regexp.MustCompile(`(?i)=\s*ANY\s*\(\$(\d+)\)`)
+	reAnyUnnest     = regexp.MustCompile(`(?i)=\s*ANY\s*\(\s*SELECT\s+unnest\s*\(\s*\$(\d+)\s*\)\s*\)`)
+	reUnnest1       = regexp.MustCompile(`(?i)\bunnest\s*\(\s*\$(\d+)\s*\)\s*AS\s+(\w+)\s*\(\s*(\w+)\s*\)`)
+	reUnnest2       = regexp.MustCompile(`(?i)\bunnest\s*\(\s*\$(\d+)\s*,\s*\$(\d+)\s*\)\s*AS\s+(\w+)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)`)
+	reUnnest3       = regexp.MustCompile(`(?i)\bunnest\s*\(\s*\$(\d+)\s*,\s*\$(\d+)\s*,\s*\$(\d+)\s*\)\s*AS\s+(\w+)\s*\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)`)
 
 	// generate_series(start, end) [AS] alias → inline recursive CTE subquery.
 	reGenerateSeries = regexp.MustCompile(`(?i)\bgenerate_series\s*\(([^)]+)\)\s*(?:AS\s+)?(\w+)`)
@@ -456,6 +522,10 @@ func translateSQL(q string) string {
 	q = reIlike.ReplaceAllString(q, "LIKE")
 	q = reTrue.ReplaceAllString(q, "1")
 	q = reFalse.ReplaceAllString(q, "0")
+
+	// generate_series MUST be translated BEFORE cast stripping ($N::bigint is a valid arg, strip inside).
+	q = translateGenerateSeries(q)
+
 	q = reCast.ReplaceAllString(q, "")
 	q = reAddColIfNot.ReplaceAllString(q, "ADD COLUMN")
 	// DISTINCT ON (cols) is PostgreSQL-only; strip it. Data is deduplicated by the app.
@@ -497,9 +567,6 @@ func translateSQL(q string) string {
 		return "COUNT(DISTINCT " + strings.Join(cols, " || '|' || ") + ")"
 	})
 
-	// generate_series(start, end) [AS] alias → inline recursive CTE subquery.
-	q = translateGenerateSeries(q)
-
 	// SQLite does not allow aliases on DELETE's target table.
 	// Rewrite: DELETE FROM tbl alias WHERE → DELETE FROM tbl WHERE
 	// then replace alias. with tbl. throughout.
@@ -516,15 +583,14 @@ func translateSQL(q string) string {
 }
 
 // translateGenerateSeries rewrites each generate_series(start, end) [AS] alias
-// into an inline recursive CTE subquery that SQLite can execute:
+// into an inline recursive CTE subquery that SQLite can execute.
 //
-//	(WITH RECURSIVE _alias(n) AS
-//	   (SELECT start UNION ALL SELECT n+1 FROM _alias WHERE n < end)
-//	 SELECT n AS alias FROM _alias) AS alias
+// Runs BEFORE cast stripping so ::bigint in args (e.g. $2::bigint, $3::bigint)
+// is still present; we strip casts inside this function.
 //
-// The internal CTE uses a prefixed name to avoid shadowing the outer alias.
-// This handles both the CROSS JOIN grid pattern and the UNION ALL border pattern
-// without requiring restructuring of the surrounding query.
+// Text params ($N) bound by node-postgres become TEXT in SQLite by default.
+// Recursive CTE termination depends on INTEGER comparison, so we wrap each $N
+// with CAST(... AS INTEGER) to prevent infinite loops from type coercion.
 func translateGenerateSeries(q string) string {
 	if !strings.Contains(strings.ToLower(q), "generate_series") {
 		return q
@@ -535,17 +601,16 @@ func translateGenerateSeries(q string) string {
 
 		commaIdx := strings.Index(args, ",")
 		if commaIdx < 0 {
-			return m // unexpected form, leave unchanged
+			return m
 		}
-		start := strings.TrimSpace(args[:commaIdx])
-		end := strings.TrimSpace(args[commaIdx+1:])
+		start := reCast.ReplaceAllString(strings.TrimSpace(args[:commaIdx]), "")
+		end := reCast.ReplaceAllString(strings.TrimSpace(args[commaIdx+1:]), "")
 		internal := "_" + alias
 
-		// generate_series is inclusive on both ends; the CTE achieves this because
-		// the recursion stops when n reaches end (WHERE n < end stops *after* end
-		// is already in the result set from the previous step).
+		// Wrap parameters in CAST(... AS INTEGER) so SQLite treats them as numbers.
+		// Literal integers are unaffected by CAST, and text params become proper ints.
 		return fmt.Sprintf(
-			"(WITH RECURSIVE %s(n) AS (SELECT %s UNION ALL SELECT n+1 FROM %s WHERE n < %s) SELECT n AS %s FROM %s) AS %s",
+			"(WITH RECURSIVE %s(n) AS (SELECT CAST(%s AS INTEGER) UNION ALL SELECT n+1 FROM %s WHERE n < CAST(%s AS INTEGER)) SELECT n AS %s FROM %s) AS %s",
 			internal, start, internal, end, alias, internal, alias,
 		)
 	})
@@ -576,12 +641,33 @@ func expandStatement(q string) []string {
 }
 
 // expandParams replaces $N placeholders with ? and builds args.
-// Handles = ANY($N) by expanding the PostgreSQL array literal into IN (?,?,...).
+// Handles = ANY($N), = ANY(SELECT unnest($N)), and unnest(...) by expanding
+// PostgreSQL array literals into inline SQLite-compatible SQL.
 func expandParams(query string, params []interface{}) (string, []interface{}) {
 	var sb strings.Builder
 	var args []interface{}
 	i := 0
 	for i < len(query) {
+		// Match `= ANY(SELECT unnest($N))` starting at current position.
+		if loc := reAnyUnnest.FindStringIndex(query[i:]); loc != nil && loc[0] == 0 {
+			m := reAnyUnnest.FindStringSubmatch(query[i:])
+			n, _ := strconv.Atoi(m[1])
+			if n >= 1 && n <= len(params) {
+				elems := parsePGArray(fmt.Sprint(params[n-1]))
+				ph := strings.Repeat("?,", len(elems))
+				if len(ph) > 0 {
+					ph = ph[:len(ph)-1]
+				}
+				sb.WriteString("IN (")
+				sb.WriteString(ph)
+				sb.WriteByte(')')
+				for _, e := range elems {
+					args = append(args, e)
+				}
+			}
+			i += loc[1]
+			continue
+		}
 		// Match `= ANY($N)` starting at current position.
 		if loc := reAny.FindStringIndex(query[i:]); loc != nil && loc[0] == 0 {
 			m := reAny.FindStringSubmatch(query[i:])
@@ -598,6 +684,107 @@ func expandParams(query string, params []interface{}) (string, []interface{}) {
 				for _, e := range elems {
 					args = append(args, e)
 				}
+			}
+			i += loc[1]
+			continue
+		}
+		// Match unnest with 1 column.
+		if loc := reUnnest1.FindStringIndex(query[i:]); loc != nil && loc[0] == 0 {
+			m := reUnnest1.FindStringSubmatch(query[i:])
+			n, _ := strconv.Atoi(m[1])
+			alias, col := m[2], m[3]
+			var elems []string
+			if n >= 1 && n <= len(params) {
+				elems = parsePGArray(fmt.Sprint(params[n-1]))
+			}
+			var parts []string
+			for j, e := range elems {
+				args = append(args, e)
+				if j == 0 {
+					parts = append(parts, fmt.Sprintf("SELECT ? AS %s", col))
+				} else {
+					parts = append(parts, "SELECT ?")
+				}
+			}
+			if len(parts) == 0 {
+				sb.WriteString(fmt.Sprintf("(SELECT NULL AS %s WHERE 0) AS %s", col, alias))
+			} else {
+				sb.WriteString(fmt.Sprintf("(%s) AS %s", strings.Join(parts, " UNION ALL "), alias))
+			}
+			i += loc[1]
+			continue
+		}
+		// Match unnest with 2 columns.
+		if loc := reUnnest2.FindStringIndex(query[i:]); loc != nil && loc[0] == 0 {
+			m := reUnnest2.FindStringSubmatch(query[i:])
+			n1, _ := strconv.Atoi(m[1])
+			n2, _ := strconv.Atoi(m[2])
+			alias, col1, col2 := m[3], m[4], m[5]
+			var elems1, elems2 []string
+			if n1 >= 1 && n1 <= len(params) {
+				elems1 = parsePGArray(fmt.Sprint(params[n1-1]))
+			}
+			if n2 >= 1 && n2 <= len(params) {
+				elems2 = parsePGArray(fmt.Sprint(params[n2-1]))
+			}
+			count := len(elems1)
+			if len(elems2) < count {
+				count = len(elems2)
+			}
+			var parts []string
+			for j := 0; j < count; j++ {
+				args = append(args, elems1[j], elems2[j])
+				if j == 0 {
+					parts = append(parts, fmt.Sprintf("SELECT ? AS %s, ? AS %s", col1, col2))
+				} else {
+					parts = append(parts, "SELECT ?, ?")
+				}
+			}
+			if len(parts) == 0 {
+				sb.WriteString(fmt.Sprintf("(SELECT NULL AS %s, NULL AS %s WHERE 0) AS %s", col1, col2, alias))
+			} else {
+				sb.WriteString(fmt.Sprintf("(%s) AS %s", strings.Join(parts, " UNION ALL "), alias))
+			}
+			i += loc[1]
+			continue
+		}
+		// Match unnest with 3 columns.
+		if loc := reUnnest3.FindStringIndex(query[i:]); loc != nil && loc[0] == 0 {
+			m := reUnnest3.FindStringSubmatch(query[i:])
+			n1, _ := strconv.Atoi(m[1])
+			n2, _ := strconv.Atoi(m[2])
+			n3, _ := strconv.Atoi(m[3])
+			alias, col1, col2, col3 := m[4], m[5], m[6], m[7]
+			var elems1, elems2, elems3 []string
+			if n1 >= 1 && n1 <= len(params) {
+				elems1 = parsePGArray(fmt.Sprint(params[n1-1]))
+			}
+			if n2 >= 1 && n2 <= len(params) {
+				elems2 = parsePGArray(fmt.Sprint(params[n2-1]))
+			}
+			if n3 >= 1 && n3 <= len(params) {
+				elems3 = parsePGArray(fmt.Sprint(params[n3-1]))
+			}
+			count := len(elems1)
+			if len(elems2) < count {
+				count = len(elems2)
+			}
+			if len(elems3) < count {
+				count = len(elems3)
+			}
+			var parts []string
+			for j := 0; j < count; j++ {
+				args = append(args, elems1[j], elems2[j], elems3[j])
+				if j == 0 {
+					parts = append(parts, fmt.Sprintf("SELECT ? AS %s, ? AS %s, ? AS %s", col1, col2, col3))
+				} else {
+					parts = append(parts, "SELECT ?, ?, ?")
+				}
+			}
+			if len(parts) == 0 {
+				sb.WriteString(fmt.Sprintf("(SELECT NULL AS %s, NULL AS %s, NULL AS %s WHERE 0) AS %s", col1, col2, col3, alias))
+			} else {
+				sb.WriteString(fmt.Sprintf("(%s) AS %s", strings.Join(parts, " UNION ALL "), alias))
 			}
 			i += loc[1]
 			continue
@@ -626,25 +813,43 @@ func expandParams(query string, params []interface{}) (string, []interface{}) {
 	return sb.String(), args
 }
 
-// parsePGArray parses a PostgreSQL array literal {a,b,c} into a string slice.
+// parsePGArray parses a PostgreSQL array literal {a,b,c} or Go slice [a b c] into a string slice.
 func parsePGArray(s string) []string {
 	s = strings.TrimSpace(s)
-	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
-		if s != "" {
-			return []string{s}
+	if len(s) == 0 {
+		return nil
+	}
+	// Go slice format: [a b c] or JS-style: [a, b, c]
+	if s[0] == '[' && s[len(s)-1] == ']' {
+		inner := s[1 : len(s)-1]
+		if inner == "" {
+			return nil
 		}
-		return nil
+		parts := strings.Split(inner, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			out = append(out, strings.Trim(p, `"`))
+		}
+		return out
 	}
-	inner := s[1 : len(s)-1]
-	if inner == "" {
-		return nil
+	// PostgreSQL array literal: {a,b,c}
+	if len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}' {
+		inner := s[1 : len(s)-1]
+		if inner == "" {
+			return nil
+		}
+		parts := strings.Split(inner, ",")
+		out := make([]string, len(parts))
+		for i, p := range parts {
+			out[i] = strings.Trim(strings.TrimSpace(p), `"`)
+		}
+		return out
 	}
-	parts := strings.Split(inner, ",")
-	out := make([]string, len(parts))
-	for i, p := range parts {
-		out[i] = strings.Trim(strings.TrimSpace(p), `"`)
-	}
-	return out
+	return []string{s}
 }
 
 // decodeParams converts raw parameter bytes to Go string values (text protocol).
@@ -658,148 +863,67 @@ func decodeParams(raw [][]byte) []interface{} {
 	return out
 }
 
-// splitStatements splits SQL on semicolons, skipping those inside string literals,
-// -- line comments, and /* block comments */.
-func splitStatements(sql string) []string {
-	var stmts []string
-	var sb strings.Builder
-	inStr, inLine, inBlock := false, false, false
-	i := 0
-	for i < len(sql) {
-		c := sql[i]
-		switch {
-		case !inStr && !inBlock && !inLine && c == '-' && i+1 < len(sql) && sql[i+1] == '-':
-			inLine = true
-			i += 2
-		case inLine && c == '\n':
-			inLine = false
-			sb.WriteByte(c)
-			i++
-		case inLine:
-			i++
-		case !inStr && !inLine && c == '/' && i+1 < len(sql) && sql[i+1] == '*':
-			inBlock = true
-			i += 2
-		case inBlock && c == '*' && i+1 < len(sql) && sql[i+1] == '/':
-			inBlock = false
-			i += 2
-		case inBlock:
-			i++
-		case c == '\'' && !inStr:
-			inStr = true
-			sb.WriteByte(c)
-			i++
-		case c == '\'' && inStr:
-			inStr = false
-			sb.WriteByte(c)
-			i++
-		case c == ';' && !inStr:
-			if s := strings.TrimSpace(sb.String()); s != "" {
-				stmts = append(stmts, s)
+// splitStatements splits a raw SQL string on semicolons while respecting
+// string literals and dollar-quoted blocks.
+func splitStatements(raw string) []string {
+	var out []string
+	var current strings.Builder
+	inString := false
+	stringQuote := byte(0)
+	inDollar := false
+	var dollarTag string
+
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if inString {
+			current.WriteByte(c)
+			if c == stringQuote {
+				if i+1 < len(raw) && raw[i+1] == stringQuote {
+					current.WriteByte(raw[i+1])
+					i++
+				} else {
+					inString = false
+				}
 			}
-			sb.Reset()
-			i++
-		default:
-			sb.WriteByte(c)
-			i++
+			continue
 		}
-	}
-	if s := strings.TrimSpace(sb.String()); s != "" {
-		stmts = append(stmts, s)
-	}
-	return stmts
-}
-
-// isNoOp returns true for PG-specific statements SQLite cannot run and should ignore.
-func isNoOp(q string) bool {
-	u := strings.ToUpper(strings.TrimSpace(q))
-	return strings.Contains(u, "PG_ADVISORY") ||
-		strings.Contains(u, "DROP CONSTRAINT") ||
-		strings.Contains(u, "ADD CONSTRAINT")
-}
-
-func isSelect(q string) bool {
-	return reSelect.MatchString(q) || reReturning.MatchString(q)
-}
-
-// sqliteOID maps a SQLite declared type name to a PostgreSQL OID so the pg
-// client parses numeric columns as JS numbers instead of strings.
-func sqliteOID(typeName string) uint32 {
-	t := strings.ToUpper(strings.TrimSpace(typeName))
-	switch {
-	case strings.Contains(t, "INT"):
-		return 23 // int4 — node-postgres returns JS number (not bigint string)
-	case strings.Contains(t, "REAL"),
-		strings.Contains(t, "FLOAT"),
-		strings.Contains(t, "DOUBLE"),
-		strings.Contains(t, "NUMERIC"),
-		strings.Contains(t, "DECIMAL"):
-		return 701 // float8
-	default:
-		return 25 // text
-	}
-}
-
-// normalizeCols cleans up SQLite column names to match PostgreSQL conventions.
-// e.g. SQLite returns "count(*)" where PostgreSQL returns "count".
-func normalizeCols(cols []string) []string {
-	out := make([]string, len(cols))
-	for i, c := range cols {
-		if m := reColFunc.FindStringSubmatch(c); m != nil {
-			out[i] = m[1] // e.g. "count(*)" → "count"
-		} else {
-			out[i] = c
+		if inDollar {
+			current.WriteByte(c)
+			if c == '$' {
+				tagEnd := i + 1 + len(dollarTag)
+				if tagEnd <= len(raw) && raw[i+1:tagEnd] == dollarTag && (tagEnd == len(raw) || raw[tagEnd] == '$') {
+					inDollar = false
+				}
+			}
+			continue
 		}
+		if c == '\'' || c == '"' {
+			inString = true
+			stringQuote = c
+			current.WriteByte(c)
+			continue
+		}
+		if c == '$' {
+			j := i + 1
+			for j < len(raw) && (raw[j] == '_' || (raw[j] >= 'a' && raw[j] <= 'z') || (raw[j] >= 'A' && raw[j] <= 'Z') || (raw[j] >= '0' && raw[j] <= '9')) {
+				j++
+			}
+			if j > i+1 {
+				dollarTag = raw[i+1 : j]
+				inDollar = true
+				current.WriteByte(c)
+				continue
+			}
+		}
+		if c == ';' {
+			out = append(out, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteByte(c)
+	}
+	if current.Len() > 0 {
+		out = append(out, current.String())
 	}
 	return out
-}
-
-func toText(v interface{}) []byte {
-	if v == nil {
-		return nil
-	}
-	switch val := v.(type) {
-	case float64:
-		return []byte(strconv.FormatFloat(val, 'f', -1, 64))
-	case float32:
-		return []byte(strconv.FormatFloat(float64(val), 'f', -1, 32))
-	default:
-		return []byte(fmt.Sprint(val))
-	}
-}
-
-func cmdTag(q string, n int64) string {
-	u := strings.ToUpper(strings.TrimSpace(q))
-	switch {
-	case strings.HasPrefix(u, "INSERT"):
-		return fmt.Sprintf("INSERT 0 %d", n)
-	case strings.HasPrefix(u, "UPDATE"):
-		return fmt.Sprintf("UPDATE %d", n)
-	case strings.HasPrefix(u, "DELETE"):
-		return fmt.Sprintf("DELETE %d", n)
-	case strings.HasPrefix(u, "BEGIN"):
-		return "BEGIN"
-	case strings.HasPrefix(u, "COMMIT"):
-		return "COMMIT"
-	case strings.HasPrefix(u, "ROLLBACK"):
-		return "ROLLBACK"
-	case strings.HasPrefix(u, "CREATE"):
-		return "CREATE TABLE"
-	case strings.HasPrefix(u, "ALTER"):
-		return "ALTER TABLE"
-	case strings.HasPrefix(u, "DROP"):
-		return "DROP TABLE"
-	default:
-		return "OK"
-	}
-}
-
-func sendErr(be *pgproto3.Backend, msg string) {
-	log.Printf("pg-proxy error: %s", msg)
-	be.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "XX000", Message: msg})
-}
-
-func rfq(be *pgproto3.Backend, status byte) {
-	be.Send(&pgproto3.ReadyForQuery{TxStatus: status})
-	be.Flush()
 }
