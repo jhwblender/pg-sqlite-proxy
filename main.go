@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -22,7 +23,39 @@ var (
 	dbs          = make(map[string]*sql.DB)
 	dbsMu        sync.Mutex
 	singleDBPath string // non-empty: all connections use this one file
+
+	// knownEnumTypes records every `CREATE TYPE <name> AS ENUM (...)` name
+	// seen, so later CREATE TABLE column definitions that reference it as a
+	// type (e.g. `"recurrenceType" "RecurrenceType" NOT NULL`) can be
+	// rewritten to TEXT — SQLite has no user-defined type system at all.
+	// Process-global rather than per-connection/per-database: translateSQL
+	// has no database handle, and a type created on one connection is
+	// visible to every other Postgres client against the same proxy
+	// process, matching Postgres's actual (database-wide) scoping closely
+	// enough for the single-file-per-proxy-instance case this tool targets.
+	// Values are the enum's declared name; existing ENUM values are not
+	// tracked or enforced (see the CREATE TYPE comment in translateSQL for
+	// why: SQLite has no CHECK-on-arbitrary-values equivalent this proxy
+	// implements, so enum columns are plain unconstrained TEXT).
+	knownEnumTypes   = make(map[string]bool)
+	knownEnumTypesMu sync.Mutex
 )
+
+func registerEnumType(name string) {
+	knownEnumTypesMu.Lock()
+	knownEnumTypes[name] = true
+	knownEnumTypesMu.Unlock()
+}
+
+func enumTypeNames() []string {
+	knownEnumTypesMu.Lock()
+	defer knownEnumTypesMu.Unlock()
+	names := make([]string, 0, len(knownEnumTypes))
+	for n := range knownEnumTypes {
+		names = append(names, n)
+	}
+	return names
+}
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -241,10 +274,13 @@ func simpleQuery(be *pgproto3.Backend, sqlConn *sql.Conn, raw string, inTx bool)
 			continue
 		}
 		u := strings.ToUpper(strings.TrimSpace(s))
-		if strings.HasPrefix(u, "BEGIN") {
-			inTx = true
-		} else if strings.HasPrefix(u, "COMMIT") || strings.HasPrefix(u, "ROLLBACK") {
-			inTx = false
+		if txCmd, ok := txControlCommand(u); ok {
+			var failed bool
+			inTx, failed = execTxControl(be, sqlConn, txCmd, inTx)
+			if failed {
+				break
+			}
+			continue
 		}
 
 		var failed bool
@@ -275,10 +311,9 @@ func execPortal(be *pgproto3.Backend, sqlConn *sql.Conn, p *portal, inTx bool) b
 	q, args := expandParams(p.stmt.query, p.params)
 
 	u := strings.ToUpper(strings.TrimSpace(q))
-	if strings.HasPrefix(u, "BEGIN") {
-		inTx = true
-	} else if strings.HasPrefix(u, "COMMIT") || strings.HasPrefix(u, "ROLLBACK") {
-		inTx = false
+	if txCmd, ok := txControlCommand(u); ok {
+		inTx, _ = execTxControl(be, sqlConn, txCmd, inTx)
+		return inTx
 	}
 
 	if isNoOp(q) {
@@ -291,6 +326,48 @@ func execPortal(be *pgproto3.Backend, sqlConn *sql.Conn, p *portal, inTx bool) b
 		runDML(be, sqlConn, q, args)
 	}
 	return inTx
+}
+
+// txControlCommand recognizes BEGIN/COMMIT/ROLLBACK and returns the literal
+// SQLite command to execute plus the correct wire CommandComplete tag.
+func txControlCommand(upperTrimmed string) (cmd string, ok bool) {
+	switch {
+	case strings.HasPrefix(upperTrimmed, "BEGIN") || strings.HasPrefix(upperTrimmed, "START TRANSACTION"):
+		return "BEGIN", true
+	case strings.HasPrefix(upperTrimmed, "COMMIT") || strings.HasPrefix(upperTrimmed, "END"):
+		return "COMMIT", true
+	case strings.HasPrefix(upperTrimmed, "ROLLBACK"):
+		return "ROLLBACK", true
+	}
+	return "", false
+}
+
+// execTxControl actually executes BEGIN/COMMIT/ROLLBACK against the
+// underlying SQLite connection.
+//
+// Previously these were treated as pure no-ops: the proxy tracked an inTx
+// bool purely to report the correct ReadyForQuery transaction-status byte
+// to the client, but never issued the real SQL — every statement ran in
+// SQLite's own autocommit mode regardless of BEGIN/COMMIT/ROLLBACK. That
+// meant a client-side ROLLBACK (e.g. Prisma's `$transaction([...])` on
+// failure) never actually undid anything: every write inside the "aborted"
+// transaction had already been committed to SQLite the instant it ran. For
+// a financial application, that's silent data corruption on every failed
+// multi-statement transaction, not just a missing feature.
+func execTxControl(be *pgproto3.Backend, sqlConn *sql.Conn, cmd string, inTx bool) (newInTx bool, failed bool) {
+	if _, err := sqlConn.ExecContext(context.Background(), cmd); err != nil {
+		log.Printf("tx control error: %v | cmd: %s", err, cmd)
+		sendErr(be, err.Error())
+		return inTx, true
+	}
+	be.Send(&pgproto3.CommandComplete{CommandTag: []byte(cmd)})
+	switch cmd {
+	case "BEGIN":
+		return true, false
+	case "COMMIT", "ROLLBACK":
+		return false, false
+	}
+	return inTx, false
 }
 
 func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}, sendHeader bool) (failed bool) {
@@ -440,12 +517,12 @@ func sqliteOID(declared string) uint32 {
 
 func isNoOp(q string) bool {
 	u := strings.ToUpper(strings.TrimSpace(q))
+	// BEGIN/COMMIT/ROLLBACK are handled earlier by txControlCommand — they
+	// must actually execute, not be no-op'd, so they're intentionally not
+	// listed here (see execTxControl's comment for why).
 	return u == "" ||
 		strings.HasPrefix(u, "SET ") ||
-		strings.HasPrefix(u, "SHOW ") ||
-		strings.HasPrefix(u, "COMMIT") ||
-		strings.HasPrefix(u, "ROLLBACK") ||
-		strings.HasPrefix(u, "BEGIN")
+		strings.HasPrefix(u, "SHOW ")
 }
 
 func isSelect(q string) bool {
@@ -453,10 +530,21 @@ func isSelect(q string) bool {
 	return strings.HasPrefix(u, "SELECT")
 }
 
-// normalizeCols rewrites fully-qualified column references to bare names.
+// normalizeCols rewrites fully-qualified column references to bare names,
+// and cleans aggregate expressions (count(*), sum(x), etc.) to match
+// real PostgreSQL behaviour where unaliased aggregates return just the
+// function name.
 func normalizeCols(cols []string) []string {
 	out := make([]string, len(cols))
 	for i, c := range cols {
+		// If this is an aggregate/function expression, clean it first
+		// (must happen before stripping table prefixes, otherwise the
+		// prefix stripper would mangle e.g. COUNT(DISTINCT r.x) → x)).
+		if cleaned := cleanAggregateName(c); cleaned != c {
+			out[i] = cleaned
+			continue
+		}
+		// Otherwise strip table prefix from bare column references.
 		idx := strings.LastIndex(c, ".")
 		if idx >= 0 {
 			out[i] = c[idx+1:]
@@ -467,6 +555,31 @@ func normalizeCols(cols []string) []string {
 	return out
 }
 
+// cleanAggregateName strips the argument list from aggregate function
+// column names so they match PostgreSQL.  e.g.
+//   "count(*)"           → "count"
+//   "count(distinct x)"  → "count"
+//   "sum(price)"         → "sum"
+func cleanAggregateName(c string) string {
+	lc := strings.ToLower(c)
+	open := strings.Index(lc, "(")
+	if open < 0 {
+		return c
+	}
+	close := strings.LastIndex(lc, ")")
+	if close < 0 || close <= open {
+		return c
+	}
+	funcName := lc[:open]
+	switch funcName {
+	case "count", "sum", "avg", "min", "max",
+		"stddev", "variance", "bool_and", "bool_or",
+		"string_agg", "array_agg", "json_agg", "jsonb_agg":
+		return funcName
+	}
+	return c
+}
+
 var (
 	// reInterval: e.g. CURRENT_TIMESTAMP - INTERVAL '24 hour' or col - INTERVAL '1 day'
 	reInterval = regexp.MustCompile(`(?i)([\w.]+)\s+-\s+INTERVAL\s+'(\d+)\s+(\w+)'`)
@@ -475,10 +588,37 @@ var (
 
 	reMultiAddCol   = regexp.MustCompile(`(?i)^(ALTER\s+TABLE\s+\w+\s+ADD\s+COLUMN\s+.+)`)
 	reAddColSplit   = regexp.MustCompile(`(?i),\s*ADD\s+COLUMN\s+`)
-	reAddColIfNot   = regexp.MustCompile(`(?i)\bIF\s+NOT\s+EXISTS\b`)
+	// Scoped specifically to `ADD COLUMN IF NOT EXISTS` — SQLite has no
+	// IF NOT EXISTS clause for ADD COLUMN, so it must be stripped there.
+	// This used to be a bare `IF NOT EXISTS` match replaced with the
+	// literal string "ADD COLUMN", which corrupted every *other* use of
+	// IF NOT EXISTS in a query — most importantly `CREATE TABLE IF NOT
+	// EXISTS "X" (...)`, which SQLite supports natively and needs no
+	// translation at all, became the nonsensical `CREATE TABLE ADD COLUMN
+	// "X" (...)` and failed with a syntax error on every idempotent-DDL
+	// call (e.g. `prisma db push`, or a table-existence guard in app code).
+	reAddColIfNot   = regexp.MustCompile(`(?i)\bADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b`)
 	reBigSerial     = regexp.MustCompile(`(?i)\bBIGSERIAL\b`)
 	reSerial        = regexp.MustCompile(`(?i)\bSERIAL\b`)
 	reTimestamptz   = regexp.MustCompile(`(?i)\bTIMESTAMPTZ\b`)
+	// Plain TIMESTAMP (Prisma's default `DateTime` column mapping — most
+	// of LivingImpactBudget's columns use this, not TIMESTAMPTZ) must be
+	// mapped to TEXT exactly like TIMESTAMPTZ already is. Leaving a column
+	// declared as SQLite type "TIMESTAMP" triggers modernc.org/sqlite's
+	// own type-name-sniffing: it round-trips values through Go's time.Time
+	// on scan/write instead of treating them as opaque text. That silently
+	// breaks two things at once — (1) time.Time.String() renders in the
+	// *server's local* timezone for values with no explicit zone (e.g. a
+	// bound `Date` parameter) while a CURRENT_TIMESTAMP-defaulted value
+	// renders in UTC, so two timestamps representing nearly the same
+	// instant get stored as text in different timezones; (2) SQLite then
+	// compares those TEXT values byte-for-byte in a WHERE clause, so a
+	// range query mixing a CURRENT_TIMESTAMP-sourced column against
+	// bound-parameter bounds can silently return zero rows even though the
+	// values are seconds apart. Declaring the column as bare "TEXT"
+	// instead sidesteps the driver's time.Time auto-conversion entirely,
+	// so whatever text was written is exactly what's compared and returned.
+	reTimestamp     = regexp.MustCompile(`(?i)\bTIMESTAMP\b`)
 	reSmallint      = regexp.MustCompile(`(?i)\bSMALLINT\b`)
 	reBoolean       = regexp.MustCompile(`(?i)\bBOOLEAN\b`)
 	reVarchar       = regexp.MustCompile(`(?i)\bVARCHAR\b`)
@@ -490,6 +630,27 @@ var (
 	reCast          = regexp.MustCompile(`(?i)::\w+(?:\[\])?`)
 	reDistinctOn    = regexp.MustCompile(`(?i)DISTINCT\s+ON\s*\([^)]+\)`)
 	reDeleteAlias   = regexp.MustCompile(`(?i)^(DELETE\s+FROM\s+(\w+))\s+(\w+)\s+(WHERE.*)`)
+
+	// DROP TABLE/VIEW/INDEX ... CASCADE|RESTRICT — SQLite has no CASCADE/
+	// RESTRICT clause on DROP and rejects it outright with a syntax error.
+	// Postgres migration tooling (including Prisma's `migrate reset` /
+	// `db push --force-reset`) routinely appends CASCADE to DROP TABLE.
+	// Stripping it is not a full semantic match (SQLite's DROP doesn't
+	// cascade to dependent objects the way Postgres's does), but it makes
+	// the statement parse for the common case of dropping one table/view/
+	// index at a time, and SQLite's own foreign-key enforcement (enabled
+	// via PRAGMA foreign_keys=ON in getDB) still blocks drops that would
+	// orphan rows.
+	reDropCascade   = regexp.MustCompile(`(?i)^(\s*DROP\s+(?:TABLE|VIEW|INDEX)\b.*?)\s+(?:CASCADE|RESTRICT)\s*$`)
+
+	// ENUM types: SQLite has no CREATE TYPE. `CREATE TYPE <name> AS ENUM
+	// (...)` is captured (name may be double-quoted, as Prisma always
+	// emits) so the name can be registered and later substituted for TEXT
+	// in CREATE TABLE column definitions; DROP TYPE / ALTER TYPE are no-ops
+	// since there's no real type object to drop or extend.
+	reCreateTypeEnum = regexp.MustCompile(`(?is)^\s*CREATE\s+TYPE\s+(?:"([^"]+)"|(\w+))\s+AS\s+ENUM\s*\(`)
+	reDropType       = regexp.MustCompile(`(?is)^\s*DROP\s+TYPE\b`)
+	reAlterType      = regexp.MustCompile(`(?is)^\s*ALTER\s+TYPE\b`)
 	reCountDistinctTuple = regexp.MustCompile(`(?i)COUNT\s*\(\s*DISTINCT\s*\(([^)]+)\)\s*\)`)
 	reAny           = regexp.MustCompile(`(?i)=\s*ANY\s*\(\$(\d+)\)`)
 	reAnyUnnest     = regexp.MustCompile(`(?i)=\s*ANY\s*\(\s*SELECT\s+unnest\s*\(\s*\$(\d+)\s*\)\s*\)`)
@@ -511,9 +672,48 @@ func translateSQL(q string) string {
 		return "SELECT 1"
 	}
 
+	q = strings.TrimRight(q, " \t\r\n")
+	q = reDropCascade.ReplaceAllString(q, "$1")
+
+	// CREATE TYPE ... AS ENUM: register the name (for column-type
+	// substitution below) and no-op the statement — SQLite has no
+	// user-defined type system, so there's nothing to actually create.
+	// Enum values are NOT validated/enforced: this proxy stores the column
+	// as plain TEXT, matching its documented scope (fast local dev/CI, not
+	// full constraint fidelity — see "ADD/DROP CONSTRAINT: silently
+	// ignored" in the README). If invalid-value protection matters for a
+	// given workload, enforce it in the application layer.
+	if m := reCreateTypeEnum.FindStringSubmatch(q); m != nil {
+		name := m[1]
+		if name == "" {
+			name = m[2]
+		}
+		registerEnumType(name)
+		return ""
+	}
+	// DROP TYPE / ALTER TYPE (e.g. ADD VALUE): no real type object exists
+	// to drop or extend, so both are no-ops.
+	if reDropType.MatchString(q) || reAlterType.MatchString(q) {
+		return ""
+	}
+	// Substitute any known enum type name used as a column type — e.g.
+	// `"recurrenceType" "RecurrenceType" NOT NULL` (Prisma always quotes)
+	// or the unquoted form — with TEXT. Scoped to CREATE TABLE/ALTER TABLE
+	// so an unrelated column or table that happens to share a name with an
+	// enum elsewhere in the query isn't touched.
+	if strings.Contains(strings.ToUpper(q), "CREATE TABLE") || strings.Contains(strings.ToUpper(q), "ALTER TABLE") {
+		for _, name := range enumTypeNames() {
+			quoted := regexp.MustCompile(`"` + regexp.QuoteMeta(name) + `"`)
+			q = quoted.ReplaceAllString(q, "TEXT")
+			bare := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
+			q = bare.ReplaceAllString(q, "TEXT")
+		}
+	}
+
 	q = reBigSerial.ReplaceAllString(q, "INTEGER")
 	q = reSerial.ReplaceAllString(q, "INTEGER")
 	q = reTimestamptz.ReplaceAllString(q, "TEXT")
+	q = reTimestamp.ReplaceAllString(q, "TEXT")
 	q = reSmallint.ReplaceAllString(q, "INTEGER")
 	q = reBoolean.ReplaceAllString(q, "INTEGER")
 	q = reVarchar.ReplaceAllString(q, "TEXT")
@@ -528,6 +728,8 @@ func translateSQL(q string) string {
 
 	q = reCast.ReplaceAllString(q, "")
 	q = reAddColIfNot.ReplaceAllString(q, "ADD COLUMN")
+	// CREATE TABLE / CREATE INDEX IF NOT EXISTS need no translation —
+	// SQLite supports that clause natively — so nothing further to do here.
 	// DISTINCT ON (cols) is PostgreSQL-only; strip it. Data is deduplicated by the app.
 	q = reDistinctOn.ReplaceAllString(q, "")
 	// INTERVAL arithmetic: expr - INTERVAL 'N unit' → datetime(expr, '-N unit')
@@ -857,10 +1059,50 @@ func decodeParams(raw [][]byte) []interface{} {
 	out := make([]interface{}, len(raw))
 	for i, b := range raw {
 		if b != nil {
-			out[i] = string(b)
+			out[i] = normalizeTimestampParam(string(b))
 		}
 	}
 	return out
+}
+
+// timestampParamLayouts are the text-protocol formats node-postgres (and
+// other pg clients) actually send for a bound Date/timestamp parameter.
+// node-postgres in particular serializes JS Date values using the *local*
+// system timezone with an explicit offset (e.g.
+// "2026-07-08T18:33:02.370-05:00"), not UTC/"Z" — it does not use
+// Date.prototype.toISOString().
+var timestampParamLayouts = []string{
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02 15:04:05.999999999-07:00",
+	"2006-01-02 15:04:05-07:00",
+}
+
+// normalizeTimestampParam rewrites a timestamp-shaped bound parameter into
+// the exact text format SQLite's own CURRENT_TIMESTAMP produces: UTC,
+// "YYYY-MM-DD HH:MM:SS", no offset suffix, no sub-second digits.
+//
+// Timestamps in this proxy are stored as opaque TEXT (see the TIMESTAMP ->
+// TEXT translation in translateSQL) and compared with plain string
+// operators in SQL — there is no temporal parsing on the SQLite side at
+// all. That only produces correct orderings if every timestamp value ever
+// written is in the same textual format. Without this, a column populated
+// via `DEFAULT CURRENT_TIMESTAMP` (UTC, no offset) and the same column
+// populated via a bound `Date` parameter (local timezone, explicit offset,
+// milliseconds) hold values that represent nearly the same instant but
+// compare incorrectly as strings — a range query spanning both sources can
+// silently return the wrong rows (including zero rows) with no error.
+//
+// Values that don't parse as one of the known timestamp layouts are
+// returned unchanged — this only touches parameters that are actually
+// timestamp-shaped, so it does not affect ordinary text/number parameters.
+func normalizeTimestampParam(s string) string {
+	for _, layout := range timestampParamLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC().Format("2006-01-02 15:04:05")
+		}
+	}
+	return s
 }
 
 // splitStatements splits a raw SQL string on semicolons while respecting
