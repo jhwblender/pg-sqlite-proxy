@@ -291,6 +291,8 @@ func simpleQuery(be *pgproto3.Backend, sqlConn *sql.Conn, raw string, inTx bool)
 			}
 			if isSelect(t) {
 				failed = runSelect(be, sqlConn, t, nil, true)
+			} else if hasReturning(t) {
+				failed = runReturning(be, sqlConn, t, nil)
 			} else {
 				failed = runDML(be, sqlConn, t, nil)
 			}
@@ -322,6 +324,8 @@ func execPortal(be *pgproto3.Backend, sqlConn *sql.Conn, p *portal, inTx bool) b
 	}
 	if isSelect(q) {
 		runSelect(be, sqlConn, q, args, true)
+	} else if hasReturning(q) {
+		runReturning(be, sqlConn, q, args)
 	} else {
 		runDML(be, sqlConn, q, args)
 	}
@@ -370,7 +374,42 @@ func execTxControl(be *pgproto3.Backend, sqlConn *sql.Conn, cmd string, inTx boo
 	return inTx, false
 }
 
+// runSelect executes a real SELECT.
 func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}, sendHeader bool) (failed bool) {
+	return runQueryAndSendRows(be, sqlConn, q, args, sendHeader, "SELECT")
+}
+
+// runReturning executes an INSERT/UPDATE/DELETE ... RETURNING statement.
+//
+// Previously every non-SELECT statement — including one with a RETURNING
+// clause — went through runDML, which calls ExecContext and discards any
+// result set. RETURNING is exactly what Prisma's query engine uses by
+// default for `create()` and `update()` (`INSERT ... RETURNING "id", ...`),
+// so the write itself succeeded silently while the caller got back zero
+// rows instead of the created/updated record, with no error at all. This
+// routes RETURNING statements through the same query path as SELECT, just
+// reporting a Postgres-shaped verb+count tag instead of "SELECT".
+func runReturning(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}) (failed bool) {
+	u := strings.ToUpper(strings.TrimSpace(q))
+	verb := "UPDATE"
+	switch {
+	case strings.HasPrefix(u, "INSERT"):
+		verb = "INSERT"
+	case strings.HasPrefix(u, "DELETE"):
+		verb = "DELETE"
+	}
+	return runQueryAndSendRows(be, sqlConn, q, args, true, verb)
+}
+
+// runQueryAndSendRows executes a statement expected to return rows — a real
+// SELECT, or an INSERT/UPDATE/DELETE ... RETURNING — buffers the result,
+// infers each column's wire OID, and sends RowDescription + DataRow(s) +
+// CommandComplete. verb is "SELECT", "INSERT", "UPDATE", or "DELETE"; the
+// CommandComplete tag is built from it (with a row count for the DML verbs,
+// matching Postgres's own tag shape — "INSERT 0 <n>" / "UPDATE <n>" /
+// "DELETE <n>" — so RETURNING-based writes don't masquerade as a SELECT to
+// the client).
+func runQueryAndSendRows(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}, sendHeader bool, verb string) (failed bool) {
 	rows, err := sqlConn.QueryContext(context.Background(), q, args...)
 	if err != nil {
 		log.Printf("query error: %v | sql: %s | args: %v", err, q, args)
@@ -460,7 +499,16 @@ func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interfa
 		be.Send(&pgproto3.DataRow{Values: vals})
 	}
 
-	be.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT ")})
+	var tag string
+	switch verb {
+	case "INSERT":
+		tag = fmt.Sprintf("INSERT 0 %d", len(buffered))
+	case "UPDATE", "DELETE":
+		tag = fmt.Sprintf("%s %d", verb, len(buffered))
+	default:
+		tag = "SELECT "
+	}
+	be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
 	return false
 }
 
@@ -528,6 +576,16 @@ func isNoOp(q string) bool {
 func isSelect(q string) bool {
 	u := strings.ToUpper(strings.TrimSpace(q))
 	return strings.HasPrefix(u, "SELECT")
+}
+
+// hasReturning reports whether a non-SELECT statement carries a RETURNING
+// clause (INSERT/UPDATE/DELETE ... RETURNING ...) and so must go through
+// the query path (runReturning) rather than plain ExecContext (runDML),
+// which discards any result set.
+var reReturning = regexp.MustCompile(`(?i)\bRETURNING\b`)
+
+func hasReturning(q string) bool {
+	return reReturning.MatchString(q)
 }
 
 // normalizeCols rewrites fully-qualified column references to bare names,

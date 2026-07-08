@@ -5,6 +5,26 @@ import (
 	"testing"
 )
 
+// --- RETURNING ----------------------------------------------------------
+
+func TestHasReturning(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{`INSERT INTO "User" (id, email) VALUES ($1, $2) RETURNING id, email`, true},
+		{`UPDATE "User" SET email = $1 WHERE id = $2 RETURNING *`, true},
+		{`DELETE FROM "User" WHERE id = $1 RETURNING id`, true},
+		{`INSERT INTO "User" (id, email) VALUES ($1, $2)`, false},
+		{`SELECT * FROM "User"`, false},
+	}
+	for _, c := range cases {
+		if got := hasReturning(c.in); got != c.want {
+			t.Errorf("hasReturning(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
 // --- DROP ... CASCADE -------------------------------------------------
 
 func TestTranslateSQL_DropTableCascade(t *testing.T) {
