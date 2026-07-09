@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"regexp"
@@ -100,8 +102,9 @@ type prepStmt struct {
 }
 
 type portal struct {
-	stmt   *prepStmt
-	params []interface{}
+	stmt        *prepStmt
+	params      []interface{}
+	formatCodes []int16
 }
 
 func getDB(name string) (*sql.DB, error) {
@@ -229,8 +232,9 @@ func handleConn(conn net.Conn) {
 				continue
 			}
 			portals[m.DestinationPortal] = &portal{
-				stmt:   stmt,
-				params: decodeParams(m.Parameters),
+				stmt:        stmt,
+				params:      decodeParams(stmt.paramOIDs, m.ParameterFormatCodes, m.Parameters),
+				formatCodes: m.ParameterFormatCodes,
 			}
 			be.Send(&pgproto3.BindComplete{})
 
@@ -493,6 +497,20 @@ func execTxControl(be *pgproto3.Backend, sqlConn *sql.Conn, cmd string, inTx boo
 // NULL-substitution done by sendSelectRowDescription, and for counting
 // actual parameters in countParamPlaceholders.
 var reParamPlaceholder = regexp.MustCompile(`\$(\d+)`)
+
+// stripEnumCasts removes Prisma's CAST($N::text AS "schema"."EnumType")
+// wrappers. Prisma uses these to pass enum values over the wire as text;
+// because SQLite has no enum types we store the labels as TEXT and the cast
+// wrapper would otherwise be evaluated (incorrectly) by SQLite's CAST.
+func stripEnumCasts(q string) string {
+	for _, name := range enumTypeNames() {
+		// Match quoted or bare type name, optionally qualified by schema.
+		pattern := fmt.Sprintf(`(?i)CAST\s*\(\s*([^()]*)\s+AS\s+(?:"[^"]*"\.)*(?:"%s"|%s)\s*\)`, regexp.QuoteMeta(name), regexp.QuoteMeta(name))
+		re := regexp.MustCompile(pattern)
+		q = re.ReplaceAllString(q, "$1")
+	}
+	return q
+}
 
 // countParamPlaceholders returns the highest $N referenced in q (0 if
 // none), i.e. the number of parameters the statement actually needs.
@@ -1075,9 +1093,11 @@ func translateSQL(q string) string {
 	}
 	// Substitute any known enum type name used as a column type — e.g.
 	// `"recurrenceType" "RecurrenceType" NOT NULL` (Prisma always quotes)
-	// or the unquoted form — with TEXT. Scoped to CREATE TABLE/ALTER TABLE
-	// so an unrelated column or table that happens to share a name with an
-	// enum elsewhere in the query isn't touched.
+	// or the unquoted form — with TEXT. Prisma passes enum values as text
+	// labels, and we store them as plain TEXT so reads round-trip correctly.
+	// Scoped to CREATE TABLE/ALTER TABLE so an unrelated column or table
+	// that happens to share a name with an enum elsewhere in the query isn't
+	// touched.
 	if strings.Contains(strings.ToUpper(q), "CREATE TABLE") || strings.Contains(strings.ToUpper(q), "ALTER TABLE") {
 		for _, name := range enumTypeNames() {
 			quoted := regexp.MustCompile(`"` + regexp.QuoteMeta(name) + `"`)
@@ -1086,6 +1106,12 @@ func translateSQL(q string) string {
 			q = bare.ReplaceAllString(q, "TEXT")
 		}
 	}
+
+	// Prisma emits CAST($N::text AS "schema"."EnumType") to coerce a text
+	// parameter into an enum. Since SQLite has no enum types, and we store
+	// enum values as plain TEXT, strip the cast entirely so the original
+	// label string is inserted and returned.
+	q = stripEnumCasts(q)
 
 	q = reBigSerial.ReplaceAllString(q, "INTEGER")
 	q = reSerial.ReplaceAllString(q, "INTEGER")
@@ -1431,15 +1457,93 @@ func parsePGArray(s string) []string {
 	return []string{s}
 }
 
-// decodeParams converts raw parameter bytes to Go string values (text protocol).
-func decodeParams(raw [][]byte) []interface{} {
+// decodeParams converts raw frontend parameters into Go values suitable for
+// SQLite. It handles both text and binary encodings, using the parameter OID
+// (from Parse) and the per-message format codes (from Bind) to decide how to
+// interpret each value.
+func decodeParams(paramOIDs []uint32, formatCodes []int16, raw [][]byte) []interface{} {
 	out := make([]interface{}, len(raw))
 	for i, b := range raw {
-		if b != nil {
+		if b == nil {
+			continue
+		}
+		// Determine format: 0 = text (default), 1 = binary. If no format codes are
+		// supplied, the protocol says all parameters are text.
+		binary := false
+		if len(formatCodes) == 1 {
+			binary = formatCodes[0] == 1
+		} else if i < len(formatCodes) {
+			binary = formatCodes[i] == 1
+		}
+
+		oid := uint32(25) // default to text
+		if i < len(paramOIDs) {
+			oid = paramOIDs[i]
+		}
+
+		if binary {
+			out[i] = decodeBinaryParam(oid, b)
+			continue
+		}
+
+		// Text format: normalize booleans and timestamps. Prisma sends
+		// boolean parameters as text 'true'/'false' for INTEGER columns
+		// (after BOOLEAN -> INTEGER translation), and node-postgres sends
+		// JS Date values as RFC3339 strings.
+		s := strings.ToLower(string(b))
+		if s == "true" || s == "t" {
+			out[i] = 1
+		} else if s == "false" || s == "f" {
+			out[i] = 0
+		} else {
 			out[i] = normalizeTimestampParam(string(b))
 		}
 	}
 	return out
+}
+
+// decodeBinaryParam converts a PostgreSQL binary-encoded parameter to a Go
+// value that SQLite can bind. Without this, []byte values are stored as BLOBs
+// and read back as opaque bytes, breaking Prisma's Boolean/Enum/Integer
+// columns (which are mapped to SQLite INTEGER/TEXT by translateSQL).
+func decodeBinaryParam(oid uint32, b []byte) interface{} {
+	switch oid {
+	case 16: // bool
+		if len(b) == 0 {
+			return 0
+		}
+		if b[0] != 0 {
+			return 1
+		}
+		return 0
+	case 21: // int2
+		if len(b) >= 2 {
+			return int64(int16(binary.BigEndian.Uint16(b)))
+		}
+	case 23: // int4
+		if len(b) >= 4 {
+			return int64(int32(binary.BigEndian.Uint32(b)))
+		}
+	case 20: // int8
+		if len(b) >= 8 {
+			return int64(binary.BigEndian.Uint64(b))
+		}
+	case 700: // float4
+		if len(b) >= 4 {
+			bits := binary.BigEndian.Uint32(b)
+			return float64(math.Float32frombits(bits))
+		}
+	case 701: // float8
+		if len(b) >= 8 {
+			bits := binary.BigEndian.Uint64(b)
+			return math.Float64frombits(bits)
+		}
+	}
+	// Unknown OID or unhandled format: fall back to text. This covers enum
+	// values when the OID is not one of the well-known numeric types; Prisma
+	// may send enums as text or as an unregistered OID, and preserving the
+	// original bytes as a string is the safest default.
+	return normalizeTimestampParam(string(b))
 }
 
 // timestampParamLayouts are the text-protocol formats node-postgres (and
