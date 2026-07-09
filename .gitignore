@@ -4,3 +4,5 @@
 *.db-wal
 *.log
 .claude/
+.opencode/
+node_modules/
