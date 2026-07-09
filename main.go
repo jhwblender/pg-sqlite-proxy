@@ -89,6 +89,14 @@ func main() {
 type prepStmt struct {
 	query     string
 	paramOIDs []uint32
+	// described is true once a Describe('S') for this statement has
+	// already sent a real RowDescription (i.e. it's a SELECT — see
+	// sendSelectRowDescription). Real Postgres does not send a second,
+	// redundant RowDescription from Execute when Describe already
+	// provided one for the same statement/portal; unconditionally
+	// re-sending it (this proxy's previous behavior) is itself a protocol
+	// violation that a strict client rejects outright.
+	described bool
 }
 
 type portal struct {
@@ -173,6 +181,9 @@ func handleConn(conn net.Conn) {
 		if err != nil {
 			return
 		}
+		if os.Getenv("PGPROXY_TRACE") != "" {
+			log.Printf("TRACE recv: %T %+v", msg, msg)
+		}
 		switch m := msg.(type) {
 		case *pgproto3.Terminate:
 			return
@@ -181,9 +192,32 @@ func handleConn(conn net.Conn) {
 			inTx = simpleQuery(be, sqlConn, m.String, inTx)
 
 		case *pgproto3.Parse:
+			paramOIDs := m.ParameterOIDs
+			// A client is allowed to Parse without specifying parameter
+			// types at all (empty ParameterOIDs) and let the server infer
+			// them. This proxy has no type inference, but it must still
+			// report the correct parameter *count* in ParameterDescription
+			// — echoing back an empty list when the query text actually
+			// has $1..$N placeholders previously told strict clients (e.g.
+			// Prisma's Rust schema engine) "this statement takes 0
+			// parameters" for a statement that plainly takes N, which they
+			// correctly treated as a protocol error ("Incorrect number of
+			// parameters given to a statement. Expected 0: got: 1").
+			// Default every inferred parameter to OID 25 (text) — SQLite
+			// is untyped/dynamically-typed per value anyway, so this is
+			// never worse than a guess and lets bound values of any type
+			// through.
+			if len(paramOIDs) == 0 {
+				if n := countParamPlaceholders(m.Query); n > 0 {
+					paramOIDs = make([]uint32, n)
+					for i := range paramOIDs {
+						paramOIDs[i] = 25
+					}
+				}
+			}
 			stmts[m.Name] = &prepStmt{
 				query:     translateSQL(m.Query),
-				paramOIDs: m.ParameterOIDs,
+				paramOIDs: paramOIDs,
 			}
 			be.Send(&pgproto3.ParseComplete{})
 
@@ -201,6 +235,8 @@ func handleConn(conn net.Conn) {
 			be.Send(&pgproto3.BindComplete{})
 
 		case *pgproto3.Describe:
+			var describedQuery string
+			var targetStmt *prepStmt
 			if m.ObjectType == 'S' {
 				stmt, ok := stmts[m.Name]
 				if !ok {
@@ -209,9 +245,55 @@ func handleConn(conn net.Conn) {
 					continue
 				}
 				be.Send(&pgproto3.ParameterDescription{ParameterOIDs: stmt.paramOIDs})
+				describedQuery = stmt.query
+				targetStmt = stmt
+			} else if m.ObjectType == 'P' {
+				if p, ok := portals[m.Name]; ok {
+					describedQuery = p.stmt.query
+					targetStmt = p.stmt
+				}
 			}
-			// RowDescription is sent in Execute for SELECT; NoData for everything else.
-			be.Send(&pgproto3.NoData{})
+
+			// Real Postgres answers Describe with the statement's actual
+			// result-column shape, determined statically (without
+			// executing, since a statement-level Describe happens right
+			// after Parse — before any parameter values are bound). A
+			// lenient client like node-postgres doesn't care if this
+			// disagrees with what Execute later sends, but a strict one
+			// (e.g. Prisma's Rust schema engine, used by `db push` /
+			// `migrate dev`) does: unconditionally answering NoData here
+			// and then sending a real RowDescription from Execute for any
+			// SELECT is a protocol violation that desyncs its state
+			// machine — surfacing as an opaque "unexpected message from
+			// server" with no indication Describe was the culprit.
+			//
+			// This proxy has no query planner to determine column shape
+			// without running the statement, so for SELECT specifically it
+			// runs the query with NULL-substituted parameters purely to
+			// read back column metadata (Columns()/ColumnTypes()), without
+			// ever calling Next() to fetch a row. That's an acceptable
+			// local-dev tradeoff (see the README's documented scope) as
+			// long as it's never done for a RETURNING statement, where
+			// running it here would double any side effects — those still
+			// get NoData, matching their previous (already-working,
+			// verified) behavior via node-postgres/Prisma Client at
+			// runtime.
+			if isSelect(describedQuery) {
+				ok := sendSelectRowDescription(be, sqlConn, describedQuery)
+				// Only mark the statement as described when a real
+				// RowDescription was actually sent. Marking it
+				// unconditionally here (even when the probe failed and
+				// NoData was sent instead) previously made Execute *also*
+				// skip its own RowDescription — the client then received
+				// bare DataRow messages with no column metadata at all,
+				// which is worse than the original double-RowDescription
+				// bug this was meant to fix.
+				if ok && targetStmt != nil {
+					targetStmt.described = true
+				}
+			} else {
+				be.Send(&pgproto3.NoData{})
+			}
 			be.Flush()
 
 		case *pgproto3.Execute:
@@ -226,6 +308,31 @@ func handleConn(conn net.Conn) {
 		case *pgproto3.Sync:
 			rfq(be, txStatus(inTx))
 			be.Flush()
+
+		case *pgproto3.Close:
+			// A well-behaved extended-protocol client closes prepared
+			// statements/portals it's done with and waits for
+			// CloseComplete before proceeding — the wire protocol
+			// requires a reply to every Close. This proxy previously had
+			// no case for it at all, so it fell through the switch
+			// silently: no reply was ever sent. node-postgres rarely
+			// issues explicit Close messages so this went unnoticed, but
+			// a stricter client (e.g. Prisma's Rust schema engine, used
+			// by `db push`/`migrate dev`) does, and the missing reply
+			// desyncs its protocol state machine — the next unrelated
+			// response arrives while it's still waiting for
+			// CloseComplete, surfacing as "unexpected message from
+			// server" with no indication of what actually went wrong.
+			switch m.ObjectType {
+			case 'S':
+				delete(stmts, m.Name)
+			case 'P':
+				delete(portals, m.Name)
+			}
+			be.Send(&pgproto3.CloseComplete{})
+
+		default:
+			log.Printf("unhandled frontend message type %T — no reply sent, client may desync", m)
 		}
 		be.Flush()
 	}
@@ -311,6 +418,9 @@ func simpleQuery(be *pgproto3.Backend, sqlConn *sql.Conn, raw string, inTx bool)
 
 func execPortal(be *pgproto3.Backend, sqlConn *sql.Conn, p *portal, inTx bool) bool {
 	q, args := expandParams(p.stmt.query, p.params)
+	if os.Getenv("PGPROXY_TRACE") != "" {
+		log.Printf("TRACE execute: query=%q rawQuery=%q params=%v args=%v described=%v", q, p.stmt.query, p.params, args, p.stmt.described)
+	}
 
 	u := strings.ToUpper(strings.TrimSpace(q))
 	if txCmd, ok := txControlCommand(u); ok {
@@ -323,7 +433,11 @@ func execPortal(be *pgproto3.Backend, sqlConn *sql.Conn, p *portal, inTx bool) b
 		return inTx
 	}
 	if isSelect(q) {
-		runSelect(be, sqlConn, q, args, true)
+		// If Describe already sent a real RowDescription for this
+		// statement, don't send a second one here — see the `described`
+		// field's doc comment on prepStmt for why that's a protocol
+		// violation for strict clients.
+		runSelect(be, sqlConn, q, args, !p.stmt.described)
 	} else if hasReturning(q) {
 		runReturning(be, sqlConn, q, args)
 	} else {
@@ -375,6 +489,118 @@ func execTxControl(be *pgproto3.Backend, sqlConn *sql.Conn, cmd string, inTx boo
 }
 
 // runSelect executes a real SELECT.
+// reParamPlaceholder matches a $N parameter placeholder for the
+// NULL-substitution done by sendSelectRowDescription, and for counting
+// actual parameters in countParamPlaceholders.
+var reParamPlaceholder = regexp.MustCompile(`\$(\d+)`)
+
+// countParamPlaceholders returns the highest $N referenced in q (0 if
+// none), i.e. the number of parameters the statement actually needs.
+func countParamPlaceholders(q string) int {
+	max := 0
+	for _, m := range reParamPlaceholder.FindAllStringSubmatch(q, -1) {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > max {
+			max = n
+		}
+	}
+	return max
+}
+
+// sendSelectRowDescription answers a Describe for a SELECT statement with
+// its actual column shape, by running the query with every $N parameter
+// substituted for the literal 0 and reading back Columns()/ColumnTypes() —
+// without ever calling Next(), so no row is fetched and no data is sent.
+// 0 (rather than NULL) is used because SQLite requires LIMIT/OFFSET to be
+// a genuinely numeric expression and errors ("datatype mismatch") on
+// `LIMIT NULL` — a shape Prisma emits on essentially every findMany/
+// findUnique query. 0 is valid in any context (numeric or coerced-to-text
+// comparison) and, for a WHERE-clause comparison, is exactly as harmless
+// as NULL would have been: this probe only reads column metadata and
+// never calls Next(), so it never returns/inspects an actual row either
+// way — what matters is that this doesn't error.
+//
+// If anything goes wrong (translation produced something that doesn't
+// actually run, e.g. a dynamic pattern this proxy doesn't fully support),
+// this falls back to NoData rather than failing the Describe outright —
+// Execute will still run the real, fully-parameterized query and report
+// the authoritative result, this is purely an advisory answer for clients
+// strict enough to check it up front. Returns whether a real
+// RowDescription was actually sent, so the caller knows whether it's safe
+// to skip Execute's own RowDescription later (see prepStmt.described).
+func sendSelectRowDescription(be *pgproto3.Backend, sqlConn *sql.Conn, q string) bool {
+	probeQuery := reParamPlaceholder.ReplaceAllString(q, "0")
+
+	if os.Getenv("PGPROXY_TRACE") != "" {
+		log.Printf("TRACE describe-probe: %q -> %q", q, probeQuery)
+	}
+
+	rows, err := sqlConn.QueryContext(context.Background(), probeQuery)
+	if err != nil {
+		if os.Getenv("PGPROXY_TRACE") != "" {
+			log.Printf("TRACE describe-probe error: %v", err)
+		}
+		be.Send(&pgproto3.NoData{})
+		return false
+	}
+	defer rows.Close()
+
+	rawCols, _ := rows.Columns()
+	cols := normalizeCols(rawCols)
+	colTypes, _ := rows.ColumnTypes()
+
+	// Peek at one real row if the 0-substituted probe happens to match
+	// one (common — e.g. WHERE "userId" = 0 matches nothing, but a plain
+	// findMany-style query with no filter matches everything). This is
+	// exactly the same runtime-value OID fallback runQueryAndSendRows
+	// uses for a real Execute; doing it here too means Describe and
+	// Execute infer the *same* OIDs for a column whose declared SQLite
+	// type is ambiguous (e.g. a DOUBLE PRECISION column, which SQLite
+	// reports as an untyped/empty declared type for aggregate-like
+	// expressions). Without this, Describe fell back to a weaker
+	// declared-type-only guess than Execute's — and once Execute started
+	// trusting Describe's answer (skipping its own RowDescription), that
+	// weaker guess leaked to the client as the final word, silently
+	// turning numeric columns into strings.
+	var peeked []interface{}
+	if rows.Next() {
+		ptrs := make([]interface{}, len(cols))
+		peeked = make([]interface{}, len(cols))
+		for i := range peeked {
+			ptrs[i] = &peeked[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			peeked = nil
+		}
+	}
+
+	fields := make([]pgproto3.FieldDescription, len(cols))
+	for i, c := range cols {
+		oid := uint32(25)
+		if i < len(colTypes) {
+			oid = sqliteOID(colTypes[i].DatabaseTypeName())
+		}
+		if oid == 25 && peeked != nil && peeked[i] != nil {
+			switch peeked[i].(type) {
+			case int64:
+				oid = 23
+			case float64:
+				oid = 701
+			}
+		}
+		fields[i] = pgproto3.FieldDescription{
+			Name:                 []byte(c),
+			TableOID:             0,
+			TableAttributeNumber: 0,
+			DataTypeOID:          oid,
+			DataTypeSize:         -1,
+			TypeModifier:         -1,
+			Format:               0,
+		}
+	}
+	be.Send(&pgproto3.RowDescription{Fields: fields})
+	return true
+}
+
 func runSelect(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{}, sendHeader bool) (failed bool) {
 	return runQueryAndSendRows(be, sqlConn, q, args, sendHeader, "SELECT")
 }
@@ -545,21 +771,37 @@ func sendErr(be *pgproto3.Backend, msg string) {
 }
 
 // sqliteOID maps SQLite declared type names to PostgreSQL OIDs.
+// sqliteOID maps a declared SQLite column type to a wire OID, following
+// SQLite's own documented type-affinity determination rules (substring
+// matching, checked in this exact order — see
+// https://www.sqlite.org/datatype3.html#determination_of_column_affinity),
+// not an exact-string match. This matters because DDL translation passes
+// Postgres type names like "DOUBLE PRECISION" through to SQLite mostly
+// unchanged (SQLite resolves its own REAL affinity for it via the "DOUB"
+// substring rule), but an exact `switch` on the declared type string
+// previously didn't recognize "DOUBLE PRECISION" at all — every DOUBLE
+// PRECISION column (Prisma's mapping for Float, used throughout
+// LivingImpactBudget) silently fell through to being reported as TEXT.
 func sqliteOID(declared string) uint32 {
 	u := strings.ToUpper(declared)
-	switch u {
-	case "INTEGER":
+	switch {
+	case strings.Contains(u, "INT"):
 		return 23 // int4
-	case "REAL", "NUMERIC", "DOUBLE", "FLOAT":
-		return 701 // float8
-	case "BLOB":
+	case strings.Contains(u, "CHAR"), strings.Contains(u, "CLOB"), strings.Contains(u, "TEXT"):
+		return 25 // text
+	case strings.Contains(u, "BLOB"), u == "":
 		return 17 // bytea
-	case "TEXT", "VARCHAR", "CHAR", "CLOB":
-		return 25 // text
-	case "NULL":
-		return 25 // text (fallback)
+	case strings.Contains(u, "REAL"), strings.Contains(u, "FLOA"), strings.Contains(u, "DOUB"):
+		return 701 // float8
 	default:
-		return 25 // text
+		// SQLite's NUMERIC affinity catch-all (DECIMAL, NUMERIC, BOOLEAN,
+		// DATE, etc.) can hold an int, real, or text value depending on
+		// what was actually inserted — there's no single correct static
+		// OID for it. Default to text (as before) and let the
+		// runtime-value fallback in runQueryAndSendRows /
+		// sendSelectRowDescription upgrade it to int4/float8 when an
+		// actual row is available to inspect.
+		return 25
 	}
 }
 
@@ -707,8 +949,14 @@ var (
 	// in CREATE TABLE column definitions; DROP TYPE / ALTER TYPE are no-ops
 	// since there's no real type object to drop or extend.
 	reCreateTypeEnum = regexp.MustCompile(`(?is)^\s*CREATE\s+TYPE\s+(?:"([^"]+)"|(\w+))\s+AS\s+ENUM\s*\(`)
+	reVersionFunc    = regexp.MustCompile(`(?i)\bversion\s*\(\s*\)`)
 	reDropType       = regexp.MustCompile(`(?is)^\s*DROP\s+TYPE\b`)
 	reAlterType      = regexp.MustCompile(`(?is)^\s*ALTER\s+TYPE\b`)
+	// SQLite has no schema/namespace concept — every Prisma Postgres
+	// migration begins with `CREATE SCHEMA IF NOT EXISTS "public"`, which
+	// otherwise fails outright as unrecognized syntax.
+	reCreateSchema   = regexp.MustCompile(`(?is)^\s*CREATE\s+SCHEMA\b`)
+	reAlterAddDropConstraint = regexp.MustCompile(`(?is)^\s*ALTER\s+TABLE\s+\S+\s+(?:ADD|DROP)\s+CONSTRAINT\b`)
 	reCountDistinctTuple = regexp.MustCompile(`(?i)COUNT\s*\(\s*DISTINCT\s*\(([^)]+)\)\s*\)`)
 	reAny           = regexp.MustCompile(`(?i)=\s*ANY\s*\(\$(\d+)\)`)
 	reAnyUnnest     = regexp.MustCompile(`(?i)=\s*ANY\s*\(\s*SELECT\s+unnest\s*\(\s*\$(\d+)\s*\)\s*\)`)
@@ -718,17 +966,65 @@ var (
 
 	// generate_series(start, end) [AS] alias → inline recursive CTE subquery.
 	reGenerateSeries = regexp.MustCompile(`(?i)\bgenerate_series\s*\(([^)]+)\)\s*(?:AS\s+)?(\w+)`)
+	reOffset         = regexp.MustCompile(`(?i)\bOFFSET\b`) // see translateSQL
 )
 
 // translateSQL converts PostgreSQL DDL/DML to SQLite-compatible SQL.
+// reLeadingLineComment strips leading `-- comment` lines (and surrounding
+// blank lines) before any other translation. Several of translateSQL's
+// patterns are anchored to the start of the query (e.g. CREATE TYPE ... AS
+// ENUM detection) and never matched when a query was prefixed with a
+// comment — exactly the shape Prisma's own generated migration SQL uses
+// ("-- CreateEnum\nCREATE TYPE ..."), silently falling through to SQLite
+// as unrecognized syntax instead of being translated.
+var reLeadingLineComment = regexp.MustCompile(`^(\s*--[^\n]*\n)+`)
+
+// reSchemaQualifier strips a `"public".` or `public.` schema qualifier
+// immediately preceding a table/identifier reference. Prisma's query
+// engine always schema-qualifies every table it touches (`"public"."User"`)
+// since real Postgres requires resolving which schema a bare table name
+// lives in — but SQLite has no schema/namespace concept at all, so
+// `"public"."User"` is parsed as "table \"User\" in an attached database
+// named public", which doesn't exist. This broke every single query
+// Prisma Client issued at runtime, not just DDL. Scoped to the literal
+// schema name "public" (Prisma's default and what this proxy's CREATE
+// SCHEMA no-op already assumes) so it doesn't strip an unrelated
+// identifier that happens to be named "public".
+var reSchemaQualifier = regexp.MustCompile(`(?i)"?\bpublic\b"?\.`)
+
 func translateSQL(q string) string {
-	// PostgreSQL sequence functions have no SQLite equivalent; return a dummy value.
+	q = reLeadingLineComment.ReplaceAllString(q, "")
+	q = reSchemaQualifier.ReplaceAllString(q, "")
+
 	ql := strings.ToLower(q)
+
+	// Postgres allows a bare OFFSET with no LIMIT (Prisma emits exactly
+	// this for findMany({ skip }) with no take); SQLite's grammar requires
+	// OFFSET to follow a LIMIT, so this is a hard syntax error otherwise.
+	// SQLite's documented idiom for "no limit" is LIMIT -1.
+	if strings.Contains(ql, "offset") && !strings.Contains(ql, "limit") {
+		q = reOffset.ReplaceAllString(q, "LIMIT -1 OFFSET")
+		ql = strings.ToLower(q)
+	}
+
+	// PostgreSQL sequence functions have no SQLite equivalent; return a dummy value.
 	if strings.Contains(ql, "setval(") ||
 		strings.Contains(ql, "nextval(") ||
 		strings.Contains(ql, "currval(") {
 		return "SELECT 1"
 	}
+
+	// version() is SQLite's `sqlite_version()`'s Postgres equivalent, used
+	// by most pg drivers/ORMs — including Prisma's connection-adapter
+	// health check — as one of the very first queries on a new connection.
+	// SQLite has no such function, so this errored with "no such function:
+	// version" on literally every connection, which several clients
+	// (Prisma among them) surface as a connection-level failure rather
+	// than a query error — "Can't reach database server" even though the
+	// TCP connection and handshake had already succeeded. Match the
+	// ParameterStatus server_version already sent at startup (see
+	// doStartup) so the two don't disagree.
+	q = reVersionFunc.ReplaceAllString(q, "'PostgreSQL 15.0'")
 
 	q = strings.TrimRight(q, " \t\r\n")
 	q = reDropCascade.ReplaceAllString(q, "$1")
@@ -752,6 +1048,29 @@ func translateSQL(q string) string {
 	// DROP TYPE / ALTER TYPE (e.g. ADD VALUE): no real type object exists
 	// to drop or extend, so both are no-ops.
 	if reDropType.MatchString(q) || reAlterType.MatchString(q) {
+		return ""
+	}
+	// CREATE SCHEMA: SQLite has no schema/namespace concept; every table
+	// already lives in one flat namespace, so this is a no-op.
+	if reCreateSchema.MatchString(q) {
+		return ""
+	}
+	// ALTER TABLE ... ADD/DROP CONSTRAINT (including ADD CONSTRAINT ...
+	// FOREIGN KEY, which is how Prisma always emits foreign keys — as a
+	// separate statement after all CREATE TABLEs, specifically so it can
+	// support circular references without knowing the full table graph
+	// up front). SQLite fundamentally cannot add a constraint to an
+	// already-created table via ALTER TABLE — a foreign key can only be
+	// declared inline in CREATE TABLE, or added later via SQLite's full
+	// rename-recreate-copy-drop procedure, which this proxy does not
+	// attempt. This was already documented in the README ("ADD/DROP
+	// CONSTRAINT: silently ignored") but had no actual implementation, so
+	// every real Prisma migration's foreign-key statements hard-errored
+	// instead. Silently ignoring them (matching the documented, accepted
+	// limitation) means those relationships are NOT enforced at the
+	// database level — the same tradeoff already accepted for CHECK/UNIQUE
+	// constraints added this way.
+	if reAlterAddDropConstraint.MatchString(q) {
 		return ""
 	}
 	// Substitute any known enum type name used as a column type — e.g.

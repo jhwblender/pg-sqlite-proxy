@@ -5,6 +5,122 @@ import (
 	"testing"
 )
 
+// --- Prisma migration-file compatibility ---------------------------------
+
+func TestTranslateSQL_LeadingCommentDoesNotDefeatDetection(t *testing.T) {
+	// Prisma's generated migration SQL always prefixes each statement with
+	// a `-- CreateEnum` / `-- CreateTable` style comment. translateSQL's
+	// patterns are anchored to the start of the query, so a leading
+	// comment previously made CREATE TYPE ... AS ENUM fall through
+	// untranslated straight into a SQLite syntax error.
+	knownEnumTypesMu.Lock()
+	knownEnumTypes = make(map[string]bool)
+	knownEnumTypesMu.Unlock()
+
+	got := translateSQL("-- CreateEnum\nCREATE TYPE \"RecurrenceType\" AS ENUM ('MONTHLY')")
+	if got != "" {
+		t.Fatalf("leading comment defeated CREATE TYPE detection, got %q", got)
+	}
+}
+
+func TestTranslateSQL_CreateSchemaIsNoOp(t *testing.T) {
+	got := translateSQL(`CREATE SCHEMA IF NOT EXISTS "public"`)
+	if got != "" {
+		t.Fatalf("CREATE SCHEMA should be a no-op, got %q", got)
+	}
+}
+
+func TestTranslateSQL_AlterTableAddConstraintForeignKeyIsNoOp(t *testing.T) {
+	// This is exactly the shape Prisma emits for every foreign key: a
+	// separate ALTER TABLE ... ADD CONSTRAINT statement after all tables
+	// are created (so it can support circular references). SQLite cannot
+	// add a foreign key to an existing table via ALTER TABLE at all, so
+	// this must be a no-op (matching the README's documented, accepted
+	// "constraints are not enforced" limitation) rather than a hard error.
+	q := `ALTER TABLE "Transaction" ADD CONSTRAINT "Transaction_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE`
+	got := translateSQL(q)
+	if got != "" {
+		t.Fatalf("ADD CONSTRAINT ... FOREIGN KEY should be a no-op, got %q", got)
+	}
+}
+
+func TestTranslateSQL_AlterTableDropConstraintIsNoOp(t *testing.T) {
+	got := translateSQL(`ALTER TABLE "Transaction" DROP CONSTRAINT "Transaction_userId_fkey"`)
+	if got != "" {
+		t.Fatalf("DROP CONSTRAINT should be a no-op, got %q", got)
+	}
+}
+
+func TestTranslateSQL_SchemaQualifierStripped(t *testing.T) {
+	// Prisma's query engine schema-qualifies every table reference at
+	// runtime (not just in migrations) — SQLite has no schema concept, so
+	// this previously broke every single query with "no such table:
+	// public.User".
+	cases := []struct{ in, want string }{
+		{`SELECT * FROM "public"."User" WHERE "public"."User"."id" = $1`, `SELECT * FROM "User" WHERE "User"."id" = ?`},
+		{`SELECT * FROM public.User`, `SELECT * FROM User`},
+	}
+	for _, c := range cases {
+		got := translateSQL(c.in)
+		// translateSQL doesn't do $N -> ? conversion (that's expandParams),
+		// so only check the schema qualifier itself is gone.
+		if strings.Contains(got, "public.") || strings.Contains(got, `"public"`) {
+			t.Errorf("translateSQL(%q) = %q, schema qualifier not stripped", c.in, got)
+		}
+	}
+}
+
+func TestTranslateSQL_BareOffsetGetsLimit(t *testing.T) {
+	// Prisma emits a bare OFFSET (no LIMIT) for findMany({ skip }) with no
+	// take. Postgres allows this; SQLite's grammar requires OFFSET to
+	// follow a LIMIT and errors otherwise.
+	got := translateSQL(`SELECT * FROM "User" OFFSET $1`)
+	if !strings.Contains(got, "LIMIT -1 OFFSET") {
+		t.Fatalf("expected bare OFFSET to gain a LIMIT -1 prefix, got %q", got)
+	}
+}
+
+func TestTranslateSQL_ExistingLimitOffsetUntouched(t *testing.T) {
+	got := translateSQL(`SELECT * FROM "User" LIMIT $1 OFFSET $2`)
+	if strings.Count(got, "LIMIT") != 1 {
+		t.Fatalf("existing LIMIT ... OFFSET should not be touched, got %q", got)
+	}
+}
+
+func TestSqliteOID_DoublePrecisionMapsToFloat8(t *testing.T) {
+	// "DOUBLE PRECISION" is Prisma's Float mapping and is passed through
+	// to SQLite mostly unchanged. An exact-match switch never recognized
+	// it (only the bare words "REAL"/"DOUBLE"/"FLOAT"), silently reporting
+	// every DOUBLE PRECISION column as text.
+	if got := sqliteOID("DOUBLE PRECISION"); got != 701 {
+		t.Errorf("sqliteOID(\"DOUBLE PRECISION\") = %d, want 701 (float8)", got)
+	}
+}
+
+func TestSqliteOID_MatchesSQLiteAffinityRules(t *testing.T) {
+	cases := []struct {
+		declared string
+		want     uint32
+	}{
+		{"INTEGER", 23},
+		{"BIGINT", 23},
+		{"TEXT", 25},
+		{"VARCHAR(255)", 25},
+		{"CLOB", 25},
+		{"BLOB", 17},
+		{"", 17},
+		{"REAL", 701},
+		{"FLOAT", 701},
+		{"DOUBLE", 701},
+		{"BOOLEAN", 25}, // NUMERIC-affinity catch-all defaults to text
+	}
+	for _, c := range cases {
+		if got := sqliteOID(c.declared); got != c.want {
+			t.Errorf("sqliteOID(%q) = %d, want %d", c.declared, got, c.want)
+		}
+	}
+}
+
 // --- RETURNING ----------------------------------------------------------
 
 func TestHasReturning(t *testing.T) {
