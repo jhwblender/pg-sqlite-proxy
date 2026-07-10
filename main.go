@@ -502,9 +502,19 @@ var reParamPlaceholder = regexp.MustCompile(`\$(\d+)`)
 // wrappers. Prisma uses these to pass enum values over the wire as text;
 // because SQLite has no enum types we store the labels as TEXT and the cast
 // wrapper would otherwise be evaluated (incorrectly) by SQLite's CAST.
+//
+// Since the proxy may restart after CREATE TYPE statements have already been
+// executed (and knownEnumTypes is empty), we strip ALL casts to quoted
+// identifiers with optional schema qualification — not just known enums.
 func stripEnumCasts(q string) string {
+	// First: strip any cast to a quoted type name (with optional schema prefix).
+	// This catches Prisma's `CAST($N::text AS "public"."AccountType")`.
+	reSchemaCast := regexp.MustCompile(`(?i)CAST\s*\(\s*([^()]*)\s+AS\s+(?:"[^"]*"\.)*"[^"]*"\s*\)`)
+	q = reSchemaCast.ReplaceAllString(q, "$1")
+
+	// Second: also strip casts to known enum types (bare names, for backward
+	// compatibility and cases where the type is unquoted).
 	for _, name := range enumTypeNames() {
-		// Match quoted or bare type name, optionally qualified by schema.
 		pattern := fmt.Sprintf(`(?i)CAST\s*\(\s*([^()]*)\s+AS\s+(?:"[^"]*"\.)*(?:"%s"|%s)\s*\)`, regexp.QuoteMeta(name), regexp.QuoteMeta(name))
 		re := regexp.MustCompile(pattern)
 		q = re.ReplaceAllString(q, "$1")
