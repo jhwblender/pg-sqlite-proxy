@@ -607,7 +607,7 @@ func sendSelectRowDescription(be *pgproto3.Backend, sqlConn *sql.Conn, q string)
 		if i < len(colTypes) {
 			oid = sqliteOID(colTypes[i].DatabaseTypeName())
 		}
-		if oid == 25 && peeked != nil && peeked[i] != nil {
+		if (oid == 25 || oid == 17) && peeked != nil && peeked[i] != nil {
 			switch peeked[i].(type) {
 			case int64:
 				oid = 23
@@ -693,6 +693,16 @@ func runQueryAndSendRows(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args
 		}
 		row := make([]interface{}, len(cols))
 		copy(row, tmp)
+		// modernc.org/sqlite sometimes returns []byte for aggregate results.
+		// Convert numeric-looking []byte to int64 so downstream formatting works.
+		for i, v := range row {
+			if b, ok := v.([]byte); ok {
+				s := string(b)
+				if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+					row[i] = n
+				}
+			}
+		}
 		buffered = append(buffered, row)
 	}
 	if err := rows.Err(); err != nil {
@@ -708,16 +718,25 @@ func runQueryAndSendRows(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args
 		if i < len(colTypes) {
 			oid = sqliteOID(colTypes[i].DatabaseTypeName())
 		}
-		if oid == 25 {
+		// modernc.org/sqlite returns empty type names for aggregates, so
+		// sqliteOID falls back to either 25 (text) or 17 (bytea).  In both
+		// cases we must inspect the actual Go value and upgrade to int4 or
+		// float8 when the data is numeric, otherwise node-postgres leaves
+		// the value as a raw Buffer.
+		if oid == 25 || oid == 17 {
 			for _, row := range buffered {
 				if row[i] == nil {
 					continue
 				}
-				switch row[i].(type) {
+				switch v := row[i].(type) {
 				case int64:
 					oid = 23 // int4 — node-postgres returns JS number (not bigint string)
 				case float64:
 					oid = 701 // float8
+				case []byte:
+					if _, err := strconv.ParseInt(string(v), 10, 64); err == nil {
+						oid = 23 // int4
+					}
 				}
 				break
 			}
@@ -774,10 +793,28 @@ func runDML(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args []interface{
 		return true
 	}
 
-	// Try to get rows affected.
+	// Determine the verb so we can build a Postgres-shaped CommandComplete tag.
+	u := strings.ToUpper(strings.TrimSpace(q))
+	verb := "UPDATE"
+	switch {
+	case strings.HasPrefix(u, "INSERT"):
+		verb = "INSERT"
+	case strings.HasPrefix(u, "DELETE"):
+		verb = "DELETE"
+	}
+
+	// Build tag matching Postgres CommandComplete format so node-postgres
+	// parses the row count correctly.
 	tag := "OK"
 	if ra, err := res.RowsAffected(); err == nil {
-		tag = fmt.Sprintf("%d", ra)
+		switch verb {
+		case "INSERT":
+			tag = fmt.Sprintf("INSERT 0 %d", ra)
+		case "UPDATE", "DELETE":
+			tag = fmt.Sprintf("%s %d", verb, ra)
+		default:
+			tag = fmt.Sprintf("%d", ra)
+		}
 	}
 	be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
 	return false
