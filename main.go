@@ -603,17 +603,52 @@ func sendSelectRowDescription(be *pgproto3.Backend, sqlConn *sql.Conn, q string)
 
 	fields := make([]pgproto3.FieldDescription, len(cols))
 	for i, c := range cols {
+		declared := ""
 		oid := uint32(25)
 		if i < len(colTypes) {
-			oid = sqliteOID(colTypes[i].DatabaseTypeName())
+			declared = colTypes[i].DatabaseTypeName()
+			oid = sqliteOID(declared)
 		}
-		if (oid == 25 || oid == 17) && peeked != nil && peeked[i] != nil {
-			switch peeked[i].(type) {
+		if oid != 25 && oid != 17 {
+			fields[i] = pgproto3.FieldDescription{Name: []byte(c), TableOID: 0, TableAttributeNumber: 0, DataTypeOID: oid, DataTypeSize: -1, TypeModifier: -1, Format: 0}
+			continue
+		}
+		if peeked != nil && peeked[i] != nil {
+			// modernc.org/sqlite can return []byte or even string for
+			// aggregate/computed values (declared type ""), not just
+			// int64/float64 — mirror runQueryAndSendRows's normalization
+			// so Describe and Execute agree on the OID.
+			switch v := peeked[i].(type) {
 			case int64:
 				oid = 23
 			case float64:
 				oid = 701
+			case []byte:
+				if _, err := strconv.ParseInt(string(v), 10, 64); err == nil {
+					oid = 23
+				} else if _, err := strconv.ParseFloat(string(v), 64); err == nil {
+					oid = 701
+				}
+			case string:
+				if _, err := strconv.ParseInt(v, 10, 64); err == nil {
+					oid = 23
+				} else if _, err := strconv.ParseFloat(v, 64); err == nil {
+					oid = 701
+				}
 			}
+		} else if declared == "" {
+			// Aggregate/computed expression (MAX, SUM, COUNT, AVG, ...)
+			// with no declared type, and the 0-substituted probe matched
+			// no rows — so there's no value to inspect either (an
+			// aggregate over zero matching rows still returns one row
+			// with NULL, not zero rows). We can't know the real type from
+			// here, but every _max/_min/_sum/_avg/_count column Prisma
+			// generates in this app is numeric, so default to int4
+			// instead of leaving the bytea/text guess, which silently
+			// turns real numbers into opaque Buffers on the client even
+			// though Execute's real (fully-parameterized) row comes back
+			// as a proper number — see the P2023 bug this fixed.
+			oid = 23
 		}
 		fields[i] = pgproto3.FieldDescription{
 			Name:                 []byte(c),
@@ -693,14 +728,30 @@ func runQueryAndSendRows(be *pgproto3.Backend, sqlConn *sql.Conn, q string, args
 		}
 		row := make([]interface{}, len(cols))
 		copy(row, tmp)
-		// modernc.org/sqlite sometimes returns []byte for aggregate results.
-		// Convert numeric-looking []byte to int64 so downstream formatting works.
+		// modernc.org/sqlite returns aggregate/computed-expression results
+		// (MAX, SUM, COUNT, etc.) as []byte or even plain string rather than
+		// int64/float64, since those columns have no declared type. Convert
+		// numeric-looking values to int64/float64 so OID inference below and
+		// downstream formatting treat them as numbers. Scoped to columns with
+		// no declared type only — a real TEXT column holding e.g. "0" or
+		// "42" must keep its string value as-is.
 		for i, v := range row {
-			if b, ok := v.([]byte); ok {
-				s := string(b)
-				if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-					row[i] = n
-				}
+			if i < len(colTypes) && colTypes[i].DatabaseTypeName() != "" {
+				continue
+			}
+			var s string
+			switch b := v.(type) {
+			case []byte:
+				s = string(b)
+			case string:
+				s = b
+			default:
+				continue
+			}
+			if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+				row[i] = n
+			} else if f, err := strconv.ParseFloat(s, 64); err == nil {
+				row[i] = f
 			}
 		}
 		buffered = append(buffered, row)
